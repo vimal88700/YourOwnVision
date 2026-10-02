@@ -199,10 +199,10 @@ class StoryGenerator:
 
     DEFAULT_MODEL = "gemini-3.8-flash"
 
-    FALLBACK_MODELS = (
-        "gemini-3.8-flash",
-        "gemini-2.5-flash",
-    )
+    gemini_model=optional(
+    "GEMINI_MODEL",
+    "gemini-3.8-flash",
+),
 
     MIN_PLAYERS = 1
     MAX_PLAYERS = 20
