@@ -1482,7 +1482,7 @@ class StoryValidator:
         if not playable_roles:
             cls.fail(
                 "No playable roles exist."
-            ]
+            )
 
     # ============================================================
     # GRAPH VALIDATION
