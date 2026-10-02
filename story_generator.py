@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from google import genai
@@ -8,6 +9,9 @@ from google.genai import types
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from story_validator import StoryValidationError, StoryValidator
+
+
+logger = logging.getLogger("YourOwnVision.story_generator")
 
 
 class GeneratedSecret(BaseModel):
@@ -193,7 +197,12 @@ class StoryGenerator:
     Gameplay is handled by GameEngine.
     """
 
-    DEFAULT_MODEL = "gemini-2.5-flash"
+    DEFAULT_MODEL = "gemini-3.8-flash"
+
+    FALLBACK_MODELS = (
+        "gemini-3.8-flash",
+        "gemini-2.5-flash",
+    )
 
     MIN_PLAYERS = 1
     MAX_PLAYERS = 20
@@ -234,17 +243,12 @@ class StoryGenerator:
         previous_fingerprints: list[str] | None = None,
     ) -> tuple[dict[str, Any], str]:
 
-        self._validate_player_count(
-            player_count
-        )
+        self._validate_player_count(player_count)
 
         fingerprints = [
             value.strip()
-            for value in (
-                previous_fingerprints or []
-            )
-            if isinstance(value, str)
-            and value.strip()
+            for value in (previous_fingerprints or [])
+            if isinstance(value, str) and value.strip()
         ]
 
         prompt = self._build_prompt(
@@ -252,31 +256,173 @@ class StoryGenerator:
             fingerprints,
         )
 
-        try:
-            response = await (
-                self.client.aio.models.generate_content(
-                    model=self.model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=GeneratedStory,
-                        system_instruction=(
-                            "You are the story-content "
-                            "generator for the WHAT HAPPENS? "
-                            "Telegram game. Generate only "
-                            "story data. Never generate "
-                            "executable code, Telegram API "
-                            "calls, SQL, or gameplay decisions."
-                        ),
-                        temperature=0.8,
-                    ),
+        last_api_error: Exception | None = None
+
+        models_to_try: list[str] = []
+
+        for candidate in (
+            self.model,
+            *self.FALLBACK_MODELS,
+        ):
+            candidate = candidate.strip()
+
+            if (
+                candidate
+                and candidate not in models_to_try
+            ):
+                models_to_try.append(candidate)
+
+        response = None
+
+        # ---------------------------------------------------------
+        # FIRST ATTEMPT
+        # Gemini structured JSON + Pydantic schema
+        # ---------------------------------------------------------
+
+        for model_name in models_to_try:
+
+            try:
+
+                logger.info(
+                    "Generating story with Gemini "
+                    "model=%s players=%s",
+                    model_name,
+                    player_count,
                 )
+
+                response = (
+                    await self.client.aio.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            response_schema=GeneratedStory,
+                            system_instruction=(
+                                "You are the story-content "
+                                "generator for the WHAT HAPPENS? "
+                                "Telegram game. "
+                                "Generate story data only. "
+                                "Never generate executable code, "
+                                "Telegram API calls, SQL, "
+                                "or gameplay decisions."
+                            ),
+                            temperature=0.8,
+                        ),
+                    )
+                )
+
+                self.model = model_name
+
+                logger.info(
+                    "Gemini structured story generation "
+                    "succeeded with model=%s",
+                    model_name,
+                )
+
+                break
+
+            except Exception as exc:
+
+                last_api_error = exc
+
+                logger.exception(
+                    "Structured Gemini story generation "
+                    "failed with model=%s: %s",
+                    model_name,
+                    exc,
+                )
+
+        # ---------------------------------------------------------
+        # SECOND ATTEMPT
+        # Plain JSON without response_schema
+        # ---------------------------------------------------------
+
+        if response is None:
+
+            for model_name in models_to_try:
+
+                try:
+
+                    logger.warning(
+                        "Retrying Gemini story generation "
+                        "without response_schema. model=%s",
+                        model_name,
+                    )
+
+                    response = (
+                        await self.client.aio.models.generate_content(
+                            model=model_name,
+                            contents=(
+                                prompt
+                                + "\n\n"
+                                "IMPORTANT:\n"
+                                "Return ONLY one valid JSON "
+                                "object.\n"
+                                "Do NOT use Markdown fences.\n"
+                                "Do NOT add explanations.\n"
+                                "Do NOT add commentary."
+                            ),
+                            config=types.GenerateContentConfig(
+                                response_mime_type="application/json",
+                                system_instruction=(
+                                    "Return only a single valid "
+                                    "JSON object matching the "
+                                    "requested story structure. "
+                                    "No Markdown. "
+                                    "No commentary."
+                                ),
+                                temperature=0.7,
+                            ),
+                        )
+                    )
+
+                    self.model = model_name
+
+                    logger.info(
+                        "Gemini plain JSON fallback succeeded "
+                        "with model=%s",
+                        model_name,
+                    )
+
+                    break
+
+                except Exception as exc:
+
+                    last_api_error = exc
+
+                    logger.exception(
+                        "Gemini JSON fallback failed "
+                        "with model=%s: %s",
+                        model_name,
+                        exc,
+                    )
+
+        # ---------------------------------------------------------
+        # COMPLETE FAILURE
+        # ---------------------------------------------------------
+
+        if response is None:
+
+            detail = (
+                str(last_api_error).strip()
+                if last_api_error
+                else "Unknown Gemini API error."
             )
 
-        except Exception as exc:
+            if not detail:
+                detail = "Unknown Gemini API error."
+
+            if len(detail) > 1000:
+                detail = detail[:1000] + "..."
+
             raise RuntimeError(
-                "Gemini story generation failed."
-            ) from exc
+                "Gemini story generation failed: "
+                f"{detail}"
+            ) from last_api_error
+
+        # ---------------------------------------------------------
+        # READ GEMINI RESPONSE
+        # ---------------------------------------------------------
 
         parsed = getattr(
             response,
@@ -292,41 +438,89 @@ class StoryGenerator:
 
         try:
 
+            # Gemini structured response
             if isinstance(
                 parsed,
                 GeneratedStory,
             ):
+
                 generated = parsed
 
+            # Parsed dictionary/object
             elif parsed is not None:
+
                 generated = (
                     GeneratedStory.model_validate(
                         parsed
                     )
                 )
 
+            # Plain JSON response
             elif raw_text:
+
+                cleaned = raw_text.strip()
+
+                # Remove accidental Markdown JSON fences.
+                if cleaned.startswith("```"):
+
+                    lines = cleaned.splitlines()
+
+                    if (
+                        lines
+                        and lines[0]
+                        .strip()
+                        .startswith("```")
+                    ):
+                        lines = lines[1:]
+
+                    if (
+                        lines
+                        and lines[-1].strip()
+                        == "```"
+                    ):
+                        lines = lines[:-1]
+
+                    cleaned = "\n".join(
+                        lines
+                    ).strip()
+
                 generated = (
-                    GeneratedStory.model_validate_json(
-                        raw_text
+                    GeneratedStory
+                    .model_validate_json(
+                        cleaned
                     )
                 )
 
             else:
+
                 raise StoryValidationError(
                     "Gemini returned no story content."
                 )
 
         except ValidationError as exc:
 
+            logger.error(
+                "Gemini returned invalid story "
+                "JSON/schema: %s",
+                exc,
+            )
+
             raise StoryValidationError(
-                "Gemini returned story data that does "
-                "not match the required schema."
+                "Gemini returned story data that "
+                "does not match the required schema."
             ) from exc
+
+        # ---------------------------------------------------------
+        # CONVERT TO NORMAL DICT
+        # ---------------------------------------------------------
 
         story = generated.model_dump(
             mode="json"
         )
+
+        # ---------------------------------------------------------
+        # YOUR EXISTING STORY VALIDATOR
+        # ---------------------------------------------------------
 
         try:
 
@@ -338,13 +532,24 @@ class StoryGenerator:
             )
 
         except StoryValidationError:
+
             raise
 
         except Exception as exc:
 
+            logger.exception(
+                "Generated story failed "
+                "semantic validation."
+            )
+
             raise StoryValidationError(
-                "Generated story failed semantic validation."
+                "Generated story failed "
+                "semantic validation."
             ) from exc
+
+        # ---------------------------------------------------------
+        # DUPLICATE STORY CHECK
+        # ---------------------------------------------------------
 
         fingerprint = (
             StoryValidator.structural_fingerprint(
@@ -353,10 +558,18 @@ class StoryGenerator:
         )
 
         if fingerprint in fingerprints:
+
             raise StoryValidationError(
                 "Gemini generated a story whose "
                 "structure duplicates a previous story."
             )
+
+        logger.info(
+            "Story generation completed successfully. "
+            "model=%s fingerprint=%s",
+            self.model,
+            fingerprint,
+        )
 
         return (
             validated_story,
@@ -510,7 +723,6 @@ Previous structural fingerprints:
 Return ONLY the structured JSON object.
 """
 
-
     @classmethod
     def _validate_player_count(
         cls,
@@ -527,6 +739,7 @@ Return ONLY the structured JSON object.
                 bool,
             )
         ):
+
             raise ValueError(
                 "player_count must be an integer."
             )
@@ -536,12 +749,12 @@ Return ONLY the structured JSON object.
             <= player_count
             <= cls.MAX_PLAYERS
         ):
+
             raise ValueError(
-                f"player_count must be between "
+                "player_count must be between "
                 f"{cls.MIN_PLAYERS} and "
                 f"{cls.MAX_PLAYERS}."
             )
-
 
     async def close(
         self,
