@@ -102,6 +102,11 @@ class Database:
             )
 
         self.base_url = base_url.rstrip("/")
+        # Supabase REST paths are added by request() and rpc().
+        # Prevent /rest/v1/rest/v1/... when the environment
+        # variable already contains the REST prefix.
+        if self.base_url.endswith("/rest/v1"):
+            self.base_url = self.base_url[:-len("/rest/v1")].rstrip("/")
 
         self.headers = {
             "apikey": service_key,
