@@ -260,7 +260,7 @@ CONFIG = Config(
     # change GEMINI_MODEL in Render instead of changing code.
     gemini_model=optional(
         "GEMINI_MODEL",
-        "gemini-2.5-flash",
+        "gemini-3.8-flash",
     ),
 
     # ============================================================
