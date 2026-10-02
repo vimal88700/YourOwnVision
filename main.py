@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -12,7 +11,6 @@ from telegram import Update
 
 from bot import (
     create_application,
-    game_service,
     process_update,
     recover_active_games,
 )
@@ -37,29 +35,19 @@ logging.basicConfig(
     ),
 )
 
-logger = logging.getLogger(
-    "YourOwnVision.main"
-)
+logger = logging.getLogger("YourOwnVision.main")
 
 
 # ============================================================
-# GLOBAL RUNTIME STATE
+# TELEGRAM APPLICATION
 # ============================================================
 
 telegram_application = create_application()
 
 recovery_task: asyncio.Task[None] | None = None
-
 shutdown_event = asyncio.Event()
 
-
-# ============================================================
-# CONSTANTS
-# ============================================================
-
 RECOVERY_INTERVAL_SECONDS = 10
-
-HEALTH_STATUS = "ok"
 
 
 # ============================================================
@@ -67,43 +55,20 @@ HEALTH_STATUS = "ok"
 # ============================================================
 
 def webhook_url() -> str:
-    """
-    Return the complete public Telegram webhook URL.
+    base = CONFIG.public_base_url.rstrip("/")
+    path = CONFIG.telegram_webhook_path
 
-    Example:
-
-        https://example.onrender.com/telegram/webhook
-    """
-
-    base = (
-        CONFIG.public_base_url
-        .rstrip("/")
-    )
-
-    path = (
-        CONFIG.telegram_webhook_path
-        if CONFIG.telegram_webhook_path.startswith("/")
-        else f"/{CONFIG.telegram_webhook_path}"
-    )
+    if not path.startswith("/"):
+        path = f"/{path}"
 
     return f"{base}{path}"
 
 
 # ============================================================
-# TELEGRAM WEBHOOK
+# TELEGRAM WEBHOOK REGISTRATION
 # ============================================================
 
 async def configure_telegram_webhook() -> None:
-    """
-    Register the Render HTTPS endpoint with Telegram.
-
-    This replaces Telegram polling/getUpdates completely.
-
-    Telegram will POST updates to:
-
-        /telegram/webhook
-    """
-
     url = webhook_url()
 
     logger.info(
@@ -121,67 +86,26 @@ async def configure_telegram_webhook() -> None:
         drop_pending_updates=False,
     )
 
+    info = await telegram_application.bot.get_webhook_info()
+
     logger.info(
-        "Telegram webhook registered successfully."
+        "Telegram webhook registered: url=%s pending=%s "
+        "last_error=%s",
+        info.url or "<empty>",
+        info.pending_update_count,
+        info.last_error_message or "<none>",
     )
 
 
-async def remove_telegram_webhook() -> None:
-    """
-    Remove the webhook during application shutdown.
-
-    Pending updates are deliberately NOT discarded.
-    """
-
-    try:
-        await telegram_application.bot.delete_webhook(
-            drop_pending_updates=False,
-        )
-
-        logger.info(
-            "Telegram webhook removed."
-        )
-
-    except Exception:
-        logger.exception(
-            "Failed to remove Telegram webhook."
-        )
-
-
 # ============================================================
-# DATABASE RECOVERY
+# GAME RECOVERY
 # ============================================================
 
 async def recovery_loop() -> None:
-    """
-    Recover gameplay using persistent Supabase deadlines.
-
-    IMPORTANT:
-
-    This loop is only a convenience/recovery worker.
-
-    It is NOT the source of truth for timers.
-
-    The authoritative deadline is stored in Supabase.
-
-    Therefore:
-
-        Render restart
-            ↓
-        process starts again
-            ↓
-        database is inspected
-            ↓
-        expired rounds are resolved
-
-    No game is lost simply because this process stopped.
-    """
-
     logger.info(
         "Persistent game recovery loop started."
     )
 
-    # Immediate recovery after startup.
     try:
         await recover_active_games()
 
@@ -196,7 +120,6 @@ async def recovery_loop() -> None:
                 shutdown_event.wait(),
                 timeout=RECOVERY_INTERVAL_SECONDS,
             )
-
         except asyncio.TimeoutError:
             pass
 
@@ -221,56 +144,28 @@ async def recovery_loop() -> None:
 # ============================================================
 
 @asynccontextmanager
-async def lifespan(
-    app: FastAPI,
-):
-    """
-    Application lifecycle.
-
-    Startup order:
-
-        1. Initialize PTB
-        2. Start PTB application
-        3. Register Telegram webhook
-        4. Recover persistent game state
-        5. Start recovery loop
-
-    Shutdown order:
-
-        1. Stop recovery loop
-        2. Remove Telegram webhook
-        3. Stop PTB
-        4. Shutdown PTB
-    """
-
+async def lifespan(app: FastAPI):
     global recovery_task
 
     logger.info(
         "Starting YourOwnVision application..."
     )
 
-    # --------------------------------------------------------
-    # TELEGRAM APPLICATION INITIALIZATION
-    # --------------------------------------------------------
+    shutdown_event.clear()
 
+    # python-telegram-bot is used only as an update processor.
+    # Telegram transport itself is handled by FastAPI.
     await telegram_application.initialize()
-
     await telegram_application.start()
 
     logger.info(
         "Telegram application initialized."
     )
 
-    # --------------------------------------------------------
-    # WEBHOOK REGISTRATION
-    # --------------------------------------------------------
-
+    # Register the webhook on every startup.
     await configure_telegram_webhook()
 
-    # --------------------------------------------------------
-    # DATABASE RECOVERY
-    # --------------------------------------------------------
-
+    # Recover any persistent game state.
     try:
         await recover_active_games()
 
@@ -278,12 +173,6 @@ async def lifespan(
         logger.exception(
             "Startup game recovery failed."
         )
-
-    # --------------------------------------------------------
-    # BACKGROUND RECOVERY
-    # --------------------------------------------------------
-
-    shutdown_event.clear()
 
     recovery_task = asyncio.create_task(
         recovery_loop(),
@@ -302,10 +191,6 @@ async def lifespan(
             "Shutting down YourOwnVision..."
         )
 
-        # ----------------------------------------------------
-        # STOP RECOVERY
-        # ----------------------------------------------------
-
         shutdown_event.set()
 
         if recovery_task is not None:
@@ -322,15 +207,21 @@ async def lifespan(
 
             recovery_task = None
 
-        # ----------------------------------------------------
-        # TELEGRAM WEBHOOK
-        # ----------------------------------------------------
+        # IMPORTANT:
+        #
+        # DO NOT call delete_webhook() here.
+        #
+        # During a Render deploy, the old instance can receive
+        # SIGTERM after the new instance has already registered
+        # the webhook. Deleting it here can remove the webhook
+        # belonging to the new instance.
+        #
+        # The webhook is persistent Telegram configuration and
+        # should be replaced on startup, not deleted on shutdown.
 
-        await remove_telegram_webhook()
-
-        # ----------------------------------------------------
-        # TELEGRAM APPLICATION
-        # ----------------------------------------------------
+        logger.info(
+            "Leaving Telegram webhook registered."
+        )
 
         try:
             await telegram_application.stop()
@@ -354,14 +245,12 @@ async def lifespan(
 
 
 # ============================================================
-# FASTAPI APPLICATION
+# FASTAPI
 # ============================================================
 
 app = FastAPI(
     title="YourOwnVision",
-    description=(
-        "WHAT HAPPENS? deterministic Telegram story game."
-    ),
+    description="WHAT HAPPENS? deterministic Telegram story game.",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -376,26 +265,15 @@ app = FastAPI(
     response_class=JSONResponse,
 )
 async def health() -> dict[str, Any]:
-    """
-    Render health endpoint.
-
-    This intentionally does not expose:
-
-    - Telegram token
-    - Gemini key
-    - Supabase key
-    - internal database credentials
-    """
-
     return {
-        "status": HEALTH_STATUS,
+        "status": "ok",
         "service": "YourOwnVision",
         "environment": CONFIG.environment,
     }
 
 
 # ============================================================
-# TELEGRAM WEBHOOK ENDPOINT
+# TELEGRAM WEBHOOK
 # ============================================================
 
 @app.post(
@@ -406,17 +284,18 @@ async def telegram_webhook(
     request: Request,
     x_telegram_bot_api_secret_token: str | None = Header(
         default=None,
+        alias="X-Telegram-Bot-Api-Secret-Token",
     ),
 ) -> dict[str, Any]:
-    """
-    Receive Telegram webhook updates.
 
-    Telegram authenticates webhook requests using the secret
-    token configured in set_webhook().
-    """
+    logger.info(
+        "Telegram webhook request received: path=%s cf_ray=%s",
+        request.url.path,
+        request.headers.get("cf-ray", "<none>"),
+    )
 
     # --------------------------------------------------------
-    # AUTHENTICATE TELEGRAM
+    # SECURITY
     # --------------------------------------------------------
 
     if (
@@ -424,8 +303,7 @@ async def telegram_webhook(
         != CONFIG.telegram_webhook_secret
     ):
         logger.warning(
-            "Rejected Telegram webhook request with invalid "
-            "secret token."
+            "Rejected Telegram webhook: invalid secret."
         )
 
         raise HTTPException(
@@ -434,29 +312,31 @@ async def telegram_webhook(
         )
 
     # --------------------------------------------------------
-    # READ JSON
+    # JSON
     # --------------------------------------------------------
 
     try:
         payload = await request.json()
 
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "Rejected Telegram webhook: invalid JSON: %s",
+            exc,
+        )
+
         raise HTTPException(
             status_code=400,
             detail="Invalid JSON.",
-        )
+        ) from exc
 
-    if not isinstance(
-        payload,
-        dict,
-    ):
+    if not isinstance(payload, dict):
         raise HTTPException(
             status_code=400,
             detail="Telegram update must be a JSON object.",
         )
 
     # --------------------------------------------------------
-    # CONVERT TO TELEGRAM UPDATE
+    # TELEGRAM UPDATE
     # --------------------------------------------------------
 
     try:
@@ -465,7 +345,7 @@ async def telegram_webhook(
             telegram_application.bot,
         )
 
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "Could not deserialize Telegram update."
         )
@@ -473,7 +353,7 @@ async def telegram_webhook(
         raise HTTPException(
             status_code=400,
             detail="Invalid Telegram update.",
-        )
+        ) from exc
 
     if update is None:
         raise HTTPException(
@@ -481,15 +361,14 @@ async def telegram_webhook(
             detail="Invalid Telegram update.",
         )
 
+    logger.info(
+        "Telegram update received: update_id=%s",
+        update.update_id,
+    )
+
     # --------------------------------------------------------
-    # PROCESS UPDATE
+    # PROCESS
     # --------------------------------------------------------
-    #
-    # Telegram expects a fast successful HTTP response.
-    #
-    # python-telegram-bot handles the actual update through
-    # Application.process_update().
-    #
 
     try:
         await process_update(
@@ -497,24 +376,43 @@ async def telegram_webhook(
             update,
         )
 
-    except Exception:
+    except Exception as exc:
         logger.exception(
-            "Telegram update processing failed."
+            "Telegram update processing failed: "
+            "update_id=%s",
+            update.update_id,
         )
 
-        # Return 200 only when the update was accepted into
-        # the application processing path. Here process_update()
-        # has already been awaited, so a failure is a real
-        # processing failure.
-        #
-        # Returning 500 lets Telegram retry the webhook update.
         raise HTTPException(
             status_code=500,
             detail="Update processing failed.",
-        )
+        ) from exc
 
     return {
         "ok": True,
+    }
+
+
+# ============================================================
+# TELEGRAM WEBHOOK DIAGNOSTICS
+# ============================================================
+
+@app.get(
+    "/telegram/status",
+    response_class=JSONResponse,
+)
+async def telegram_status() -> dict[str, Any]:
+
+    info = await telegram_application.bot.get_webhook_info()
+
+    return {
+        "url": info.url,
+        "pending_update_count": info.pending_update_count,
+        "has_custom_certificate": info.has_custom_certificate,
+        "last_error_date": info.last_error_date,
+        "last_error_message": info.last_error_message,
+        "allowed_updates": info.allowed_updates,
+        "max_connections": info.max_connections,
     }
 
 
@@ -530,25 +428,17 @@ async def root() -> dict[str, Any]:
     return {
         "service": "YourOwnVision",
         "status": "running",
+        "telegram": "webhook",
         "health": "/health",
+        "telegram_status": "/telegram/status",
     }
 
 
 # ============================================================
-# LOCAL ENTRY POINT
+# ENTRY POINT
 # ============================================================
 
 def run() -> None:
-    """
-    Start the FastAPI application with Uvicorn.
-
-    Render supplies PORT automatically.
-
-    Required binding:
-
-        0.0.0.0:$PORT
-    """
-
     import uvicorn
 
     uvicorn.run(
