@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import asyncio
-import hashlib
 import logging
-from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from telegram import (
@@ -12,7 +9,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatType
-from telegram.error import BadRequest, Forbidden, TelegramError
+from telegram.error import Forbidden, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -22,25 +19,11 @@ from telegram.ext import (
 
 from config import CONFIG
 from database import Database
-from engine import GameEngine
+from game_service import GameService
 from story_generator import StoryGenerator
 
 
-# ============================================================
-# LOGGING
-# ============================================================
-
-logging.basicConfig(
-    format=(
-        "%(asctime)s | "
-        "%(levelname)s | "
-        "%(name)s | "
-        "%(message)s"
-    ),
-    level=logging.INFO,
-)
-
-logger = logging.getLogger("YourOwnVision")
+logger = logging.getLogger("YourOwnVision.bot")
 
 
 # ============================================================
@@ -52,136 +35,38 @@ db = Database(
     CONFIG.supabase_service_key,
 )
 
-generator = StoryGenerator(
+story_generator = StoryGenerator(
     CONFIG.gemini_api_key,
     CONFIG.gemini_model,
 )
 
-
-# ============================================================
-# RUNTIME LOCKS
-# ============================================================
-
-# Prevents two Telegram callbacks / timeout jobs from
-# resolving the same game simultaneously.
-_GAME_LOCKS: dict[str, asyncio.Lock] = {}
-
-# Prevents multiple /play requests in the same chat from
-# generating multiple games at the same time.
-_CHAT_PLAY_LOCKS: dict[int, asyncio.Lock] = {}
-
-
-def get_game_lock(game_id: str) -> asyncio.Lock:
-    lock = _GAME_LOCKS.get(game_id)
-
-    if lock is None:
-        lock = asyncio.Lock()
-        _GAME_LOCKS[game_id] = lock
-
-    return lock
-
-
-def get_chat_play_lock(chat_id: int) -> asyncio.Lock:
-    lock = _CHAT_PLAY_LOCKS.get(chat_id)
-
-    if lock is None:
-        lock = asyncio.Lock()
-        _CHAT_PLAY_LOCKS[chat_id] = lock
-
-    return lock
-
-
-# ============================================================
-# TIME HELPERS
-# ============================================================
-
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).isoformat()
-
-
-def parse_iso(value: str | None) -> datetime | None:
-    if not value:
-        return None
-
-    try:
-        result = datetime.fromisoformat(
-            value.replace("Z", "+00:00")
-        )
-
-        if result.tzinfo is None:
-            result = result.replace(
-                tzinfo=timezone.utc
-            )
-
-        return result.astimezone(timezone.utc)
-
-    except ValueError:
-        logger.warning(
-            "Invalid timestamp from database: %s",
-            value,
-        )
-        return None
+game_service = GameService(
+    db,
+    story_generator,
+    join_seconds=CONFIG.game_join_seconds,
+    default_decision_seconds=CONFIG.default_decision_seconds,
+    minimum_decision_seconds=CONFIG.minimum_decision_seconds,
+    maximum_decision_seconds=CONFIG.maximum_decision_seconds,
+)
 
 
 # ============================================================
 # TELEGRAM HELPERS
 # ============================================================
 
-def display_name_from_user(user) -> str:
+def display_name(user: Any) -> str:
     if not user:
         return "Player"
 
     return (
-        user.full_name
-        or user.username
+        getattr(user, "full_name", None)
+        or getattr(user, "username", None)
         or "Player"
     )
 
 
-async def send_private(
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int,
-    text: str,
-    reply_markup: InlineKeyboardMarkup | None = None,
-) -> bool:
-    """
-    Send private role/decision information.
-
-    Returns False when the user has not opened the bot privately
-    or Telegram refuses the DM.
-    """
-
-    try:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=text,
-            reply_markup=reply_markup,
-        )
-        return True
-
-    except Forbidden:
-        logger.info(
-            "Cannot DM user %s. "
-            "They probably have not started the bot.",
-            user_id,
-        )
-        return False
-
-    except TelegramError as exc:
-        logger.warning(
-            "Private message failed for %s: %s",
-            user_id,
-            exc,
-        )
-        return False
-
-
 async def safe_answer(
-    query,
+    query: Any,
     text: str | None = None,
     *,
     show_alert: bool = False,
@@ -195,320 +80,278 @@ async def safe_answer(
         pass
 
 
-# ============================================================
-# ADMIN / CREATOR CHECKS
-# ============================================================
-
-async def is_group_admin(
+async def send_private(
     context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
     user_id: int,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
 ) -> bool:
     """
-    Checks the actual Telegram group administrator status.
+    Attempt a private Telegram message.
 
-    This is intentionally not based only on ADMIN_USER_IDS.
+    Telegram does not allow a bot to initiate a private
+    conversation with a user who has never started the bot.
+
+    Failure here MUST NOT undo the persistent game join.
     """
 
     try:
-        member = await context.bot.get_chat_member(
-            chat_id=chat_id,
-            user_id=user_id,
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=text,
+            reply_markup=reply_markup,
         )
-
-        return member.status in {
-            "administrator",
-            "creator",
-        }
-
-    except TelegramError as exc:
-        logger.warning(
-            "Could not check admin status for %s: %s",
-            user_id,
-            exc,
-        )
-
-        # Configured bot admins are still allowed.
-        return user_id in CONFIG.admin_user_ids
-
-
-async def can_stop_game(
-    context: ContextTypes.DEFAULT_TYPE,
-    game: dict[str, Any],
-    user_id: int,
-) -> bool:
-
-    if int(game["creator_id"]) == user_id:
         return True
 
-    if user_id in CONFIG.admin_user_ids:
-        return True
-
-    return await is_group_admin(
-        context,
-        int(game["chat_id"]),
-        user_id,
-    )
-
-
-# ============================================================
-# STABLE HASH
-# ============================================================
-
-def stable_number(
-    value: str,
-) -> int:
-    """
-    Python's built-in hash() is randomized between processes.
-
-    SHA-256 gives us deterministic ordering across bot restarts.
-    """
-
-    digest = hashlib.sha256(
-        value.encode("utf-8")
-    ).hexdigest()
-
-    return int(
-        digest[:16],
-        16,
-    )
-
-
-def stable_player_order(
-    game_id: str,
-    user_id: int,
-) -> int:
-
-    return stable_number(
-        f"{game_id}:{user_id}"
-    )
-
-
-# ============================================================
-# STORY GENERATION
-# ============================================================
-
-async def generate_unique_story(
-    player_count: int,
-) -> tuple[dict[str, Any], str]:
-    """
-    Gemini is used here only.
-
-    It creates the complete story universe before gameplay.
-    """
-
-    previous_fingerprints: list[str] = []
-
-    for attempt in range(1, 8):
-
+    except Forbidden:
         logger.info(
-            "Generating story attempt %s",
-            attempt,
+            "Private Telegram chat unavailable for user %s.",
+            user_id,
         )
+        return False
 
-        story, fingerprint = (
-            await generator.generate(
-                player_count=player_count,
-                previous_fingerprints=(
-                    previous_fingerprints
-                ),
-            )
+    except TelegramError:
+        logger.exception(
+            "Could not send private message to user %s.",
+            user_id,
         )
-
-        if await db.fingerprint_exists(
-            fingerprint
-        ):
-            logger.info(
-                "Story fingerprint already exists."
-            )
-
-            previous_fingerprints.append(
-                fingerprint
-            )
-
-            continue
-
-        await db.save_story_history(
-            fingerprint,
-            story,
-        )
-
-        return story, fingerprint
-
-    raise RuntimeError(
-        "Could not create a unique story "
-        "after several attempts."
-    )
+        return False
 
 
 # ============================================================
-# START COMMAND
+# TELEGRAM TEXT
+# ============================================================
+
+def story_title(
+    game: dict[str, Any],
+) -> str:
+    story = game.get("story")
+
+    if isinstance(story, dict):
+        value = story.get("title")
+
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    return "WHAT HAPPENS?"
+
+
+def scene_public_text(
+    scene: dict[str, Any],
+) -> str:
+    value = scene.get("public_text")
+
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+
+    value = scene.get("description")
+
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+
+    return "Something is happening..."
+
+
+def format_seconds(
+    seconds: int,
+) -> str:
+    seconds = max(0, int(seconds))
+
+    if seconds < 60:
+        return f"{seconds} seconds"
+
+    minutes, remainder = divmod(
+        seconds,
+        60,
+    )
+
+    if remainder == 0:
+        return (
+            f"{minutes} minute"
+            f"{'' if minutes == 1 else 's'}"
+        )
+
+    return f"{minutes}m {remainder}s"
+
+
+# ============================================================
+# /START
 # ============================================================
 
 async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-):
-    if not update.effective_message:
+) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+
+    if not message or not user:
         return
 
-    await update.effective_message.reply_text(
-        "🎭 WHAT HAPPENS?\n\n"
-        "A story game where nobody knows exactly "
+    # --------------------------------------------------------
+    # PRIVATE ONBOARDING
+    # --------------------------------------------------------
+
+    if chat and chat.type == ChatType.PRIVATE:
+        onboarded = False
+
+        try:
+            games = await db.get_active_games()
+
+            for game in games:
+                player = await db.get_player(
+                    game["id"],
+                    user.id,
+                )
+
+                if not player:
+                    continue
+
+                updated = await db.mark_player_onboarded(
+                    game["id"],
+                    user.id,
+                )
+
+                if updated:
+                    onboarded = True
+
+        except Exception:
+            logger.exception(
+                "Private onboarding failed for user %s.",
+                user.id,
+            )
+
+        if onboarded:
+            await message.reply_text(
+                "🎭 You're ready.\n\n"
+                "Your WHAT HAPPENS? private channel is now "
+                "connected to the game.\n\n"
+                "When a decision is required, I'll send it here."
+            )
+        else:
+            await message.reply_text(
+                "🎭 **WHAT HAPPENS?**\n\n"
+                "You're connected to the bot.\n\n"
+                "If you joined a game in a group, "
+                "your private role and decisions will appear here.\n\n"
+                "Otherwise, return to the group and use /play "
+                "to start a new story.",
+                parse_mode="Markdown",
+            )
+
+        return
+
+    # --------------------------------------------------------
+    # GROUP / OTHER CHAT
+    # --------------------------------------------------------
+
+    await message.reply_text(
+        "🎭 **WHAT HAPPENS?**\n\n"
+        "A deterministic story game where players shape "
         "what happens next.\n\n"
-        "Join a group and use /play.\n\n"
-        "Important:\n"
-        "Your private decisions appear in this chat "
-        "with the bot."
+        "Use /play in a group to start a game.\n\n"
+        "Your secret role and private decisions are sent "
+        "through this bot.",
+        parse_mode="Markdown",
     )
 
 
 # ============================================================
-# PLAY COMMAND
+# /PLAY
 # ============================================================
 
 async def play(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-):
-    if not update.effective_chat:
-        return
-
-    if not update.effective_message:
-        return
-
+) -> None:
+    message = update.effective_message
     chat = update.effective_chat
+    user = update.effective_user
+
+    if not message or not chat or not user:
+        return
 
     if chat.type == ChatType.PRIVATE:
-        await update.effective_message.reply_text(
+        await message.reply_text(
             "Add me to a group first.\n\n"
             "Then use /play inside the group."
         )
         return
 
-    chat_id = chat.id
-    creator = update.effective_user
+    existing = await db.get_active_game(
+        chat.id
+    )
 
-    if not creator:
+    if existing:
+        await message.reply_text(
+            "🎭 A WHAT HAPPENS? game is already active "
+            "in this group.\n\n"
+            "Use the existing game's JOIN button."
+        )
         return
 
-    lock = get_chat_play_lock(chat_id)
+    await message.reply_text(
+        "🎭 Preparing the story..."
+    )
 
-    async with lock:
-
-        existing = await db.get_active_game(
-            chat_id
+    try:
+        game = await game_service.create_game(
+            chat_id=chat.id,
+            creator_id=user.id,
         )
 
-        if existing:
-            await update.effective_message.reply_text(
-                "🎭 A WHAT HAPPENS? game is already "
-                "running in this group.\n\n"
-                "Press JOIN on the existing game."
-            )
-            return
-
-        await update.effective_message.reply_text(
-            "🎭 Preparing a new WHAT HAPPENS? story..."
-        )
-
-        try:
-            story, fingerprint = (
-                await generate_unique_story(
-                    player_count=1
-                )
-            )
-
-        except Exception:
-            logger.exception(
-                "Story generation failed."
-            )
-
-            await update.effective_message.reply_text(
-                "⚠️ I couldn't prepare the story.\n\n"
-                "Please try /play again."
-            )
-            return
-
-        join_deadline = (
-            now_utc()
-            + timedelta(
-                seconds=CONFIG.game_join_seconds
-            )
-        )
-
-        game = await db.create_game(
-            chat_id=chat_id,
-            creator_id=creator.id,
-            story=story,
-            fingerprint=fingerprint,
-            join_deadline=iso(
-                join_deadline
-            ),
-        )
-
-        await db.add_player(
+        # Creator is automatically added as the first player.
+        await game_service.join_game(
             game_id=game["id"],
-            user_id=creator.id,
-            username=creator.username or "",
-            display_name=(
-                creator.full_name
-                or creator.username
-                or "Player"
-            ),
-            role_id=None,
-            joined_round=0,
+            user_id=user.id,
+            username=user.username or "",
+            display_name=display_name(user),
         )
 
-        keyboard = InlineKeyboardMarkup(
+    except Exception as exc:
+        logger.exception(
+            "Could not create game."
+        )
+
+        await message.reply_text(
+            "⚠️ I couldn't create the game.\n\n"
+            f"{exc}"
+        )
+        return
+
+    title = story_title(game)
+
+    keyboard = InlineKeyboardMarkup(
+        [
             [
-                [
-                    InlineKeyboardButton(
-                        "🎭 JOIN",
-                        callback_data=(
-                            f"join:{game['id']}"
-                        ),
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "▶️ START",
-                        callback_data=(
-                            f"begin:{game['id']}"
-                        ),
-                    )
-                ],
-            ]
-        )
+                InlineKeyboardButton(
+                    "🎭 JOIN",
+                    callback_data=f"join:{game['id']}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "▶️ START",
+                    callback_data=f"begin:{game['id']}",
+                ),
+            ],
+        ]
+    )
 
-        title = story.get(
-            "title",
-            "WHAT HAPPENS?",
-        )
-
-        await update.effective_message.reply_text(
-            f"🎭 **WHAT HAPPENS?**\n\n"
-            f"**{title}**\n\n"
-            "A new story has been prepared.\n"
-            "The possible future is already inside it.\n\n"
-            "Anyone can JOIN.\n"
-            "Anyone can START.\n\n"
-            "Your private role and decisions will "
-            "be sent by DM.",
-            reply_markup=keyboard,
-            parse_mode="Markdown",
-        )
-
-        # Automatic start after lobby timeout.
-        context.job_queue.run_once(
-            begin_game_job,
-            when=CONFIG.game_join_seconds,
-            data={
-                "game_id": game["id"],
-                "chat_id": chat_id,
-            },
-            name=f"begin:{game['id']}",
-        )
+    await message.reply_text(
+        f"🎭 **WHAT HAPPENS?**\n\n"
+        f"**{title}**\n\n"
+        "The story is prepared and validated.\n"
+        "Players can now join.\n\n"
+        "Your private role and decisions will be "
+        "sent by DM.\n\n"
+        "If Telegram has never received `/start` "
+        "from a player, they must open the bot privately "
+        "before private decisions can be delivered.",
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+    )
 
 
 # ============================================================
@@ -516,77 +359,37 @@ async def play(
 # ============================================================
 
 async def join_game(
-    query,
+    query: Any,
     context: ContextTypes.DEFAULT_TYPE,
     game_id: str,
-):
+) -> None:
     user = query.from_user
 
-    game = await db.get_game(
-        game_id
-    )
+    try:
+        game = await game_service.get_game(
+            game_id
+        )
 
-    if not game:
+        player = await game_service.join_game(
+            game_id=game_id,
+            user_id=user.id,
+            username=user.username or "",
+            display_name=display_name(user),
+        )
+
+    except Exception as exc:
+        logger.info(
+            "Join rejected for user %s: %s",
+            user.id,
+            exc,
+        )
+
         await safe_answer(
             query,
-            "Game not found.",
+            str(exc),
             show_alert=True,
         )
         return
-
-    if game["status"] == "ended":
-        await safe_answer(
-            query,
-            "This game has already ended.",
-            show_alert=True,
-        )
-        return
-
-    existing_player = await db.get_player(
-        game_id,
-        user.id,
-    )
-
-    if existing_player:
-        await safe_answer(
-            query,
-            "You're already in this story.",
-            show_alert=True,
-        )
-        return
-
-    status = game["status"]
-
-    if status == "lobby":
-        joined_round = 0
-
-    elif status == "playing":
-        # A late player starts participating from
-        # the NEXT round, not the current one.
-        joined_round = (
-            int(game["current_round"]) + 1
-        )
-
-    else:
-        await safe_answer(
-            query,
-            "You cannot join this game now.",
-            show_alert=True,
-        )
-        return
-
-    await db.add_player(
-        game_id=game_id,
-        user_id=user.id,
-        username=user.username or "",
-        display_name=(
-            user.full_name
-            or user.username
-            or "Player"
-        ),
-        role_id=None,
-        joined_round=joined_round,
-    )
 
     await safe_answer(
         query,
@@ -594,48 +397,52 @@ async def join_game(
         show_alert=True,
     )
 
-    # Explain that private decisions require the
-    # player to open the bot.
+    # --------------------------------------------------------
+    # PRIVATE ONBOARDING
+    # --------------------------------------------------------
+
     dm_ok = await send_private(
         context,
         user.id,
-        "🎭 You're now part of WHAT HAPPENS?\n\n"
-        "Keep this chat open.\n"
-        "Your secret role and private decisions "
-        "will appear here.",
+        "🎭 **You're in WHAT HAPPENS?**\n\n"
+        "Your private role and decisions will be sent here.\n\n"
+        "If this is your first time using the bot, "
+        "send `/start` in this private chat.",
+        parse_mode=None,
     )
 
-    try:
-        if status == "lobby":
-            await context.bot.send_message(
-                chat_id=game["chat_id"],
-                text=(
-                    f"👋 {display_name_from_user(user)} "
-                    "joined the story."
-                ),
-            )
-
-        else:
-            await context.bot.send_message(
-                chat_id=game["chat_id"],
-                text=(
-                    f"👋 {display_name_from_user(user)} "
-                    "entered the story.\n\n"
-                    "Their character will join at the "
-                    "next story point."
-                ),
-            )
-
-    except TelegramError:
-        pass
-
     if not dm_ok:
-        await safe_answer(
-            query,
-            "Join successful. Start the bot privately "
-            "with /start so I can send your decisions.",
-            show_alert=True,
-        )
+        # Do NOT remove the player.
+        #
+        # The persistent membership is valid.
+        # The user simply has not opened the private bot chat.
+        try:
+            await context.bot.send_message(
+                chat_id=game["chat_id"],
+                text=(
+                    f"👋 {display_name(user)} joined.\n\n"
+                    "⚠️ Before the game starts, "
+                    "open the bot privately and send /start "
+                    "so I can deliver your secret role and decisions."
+                ),
+            )
+        except TelegramError:
+            pass
+
+    else:
+        try:
+            await context.bot.send_message(
+                chat_id=game["chat_id"],
+                text=(
+                    f"👋 {display_name(user)} joined the story."
+                ),
+            )
+        except TelegramError:
+            pass
+
+    # Silence unused-variable warnings while keeping the
+    # returned persistent player available for future UI.
+    _ = player
 
 
 # ============================================================
@@ -643,17 +450,16 @@ async def join_game(
 # ============================================================
 
 async def begin_game(
-    query,
+    query: Any,
     context: ContextTypes.DEFAULT_TYPE,
     game_id: str,
-):
-    user = query.from_user
+) -> None:
+    try:
+        game = await game_service.get_game(
+            game_id
+        )
 
-    game = await db.get_game(
-        game_id
-    )
-
-    if not game:
+    except Exception:
         await safe_answer(
             query,
             "Game not found.",
@@ -661,227 +467,58 @@ async def begin_game(
         )
         return
 
-    if game["status"] == "ended":
+    if game.get("status") != "lobby":
         await safe_answer(
             query,
-            "This game has already ended.",
+            "This game cannot be started now.",
             show_alert=True,
         )
         return
 
-    if game["status"] == "playing":
-        await safe_answer(
-            query,
-            "The game is already running.",
-            show_alert=True,
-        )
-        return
-
-    # IMPORTANT:
-    # Anyone can start the game.
-    # Only STOP is restricted to creator/admin.
     await safe_answer(
         query,
         "Starting...",
     )
 
-    await start_game(
-        game_id,
-        context,
-    )
-
-
-async def start_game(
-    game_id: str,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    lock = get_game_lock(game_id)
-
-    async with lock:
-
-        game = await db.get_game(
-            game_id
-        )
-
-        if not game:
-            return
-
-        if game["status"] != "lobby":
-            return
-
-        players = await db.get_players(
-            game_id
-        )
-
-        if not players:
-            return
-
-        story = game["story"]
-
-        try:
-            engine = GameEngine(
-                story
-            )
-        except Exception:
-            logger.exception(
-                "Invalid story for game %s",
-                game_id,
-            )
-
-            await end_game(
-                game_id,
-                context,
-                "⚠️ The story could not be loaded.",
-            )
-            return
-
-        roles = story.get(
-            "roles",
-            [],
-        )
-
-        if not roles:
-            await end_game(
-                game_id,
-                context,
-                "⚠️ The story has no characters.",
-            )
-            return
-
-        # Stable ordering.
-        ordered_players = sorted(
-            players,
-            key=lambda player: (
-                stable_player_order(
-                    game_id,
-                    int(player["user_id"]),
-                )
-            ),
-        )
-
-        # Assign available roles.
-        #
-        # If there are more players than initial roles,
-        # roles are reused only when necessary.
-        #
-        # A future version can instead generate more
-        # roles dynamically before the game starts.
-        for index, player in enumerate(
-            ordered_players
-        ):
-            role = roles[
-                index % len(roles)
-            ]
-
-            await db.update_player(
-                game_id,
-                int(player["user_id"]),
-                {
-                    "role_id": role["id"],
-                    "joined_round": 1,
-                },
-            )
-
-        scene = engine.first_scene()
-
-        seconds = safe_timer(
-            scene.get(
-                "timer_seconds"
-            )
-        )
-
-        deadline = (
-            now_utc()
-            + timedelta(
-                seconds=seconds
-            )
-        )
-
-        await db.update_game(
-            game_id,
-            {
-                "status": "playing",
-                "current_scene_id": scene["id"],
-                "current_round": 1,
-                "decision_deadline": iso(
-                    deadline
-                ),
-                "updated_at": iso(
-                    now_utc()
-                ),
-            },
-        )
-
-        title = story.get(
-            "title",
-            "WHAT HAPPENS?",
-        )
-
-        public_text = scene.get(
-            "public_text",
-            "Something is happening...",
-        )
-
-        await context.bot.send_message(
-            chat_id=game["chat_id"],
-            text=(
-                f"🎬 **{title}**\n\n"
-                f"{public_text}\n\n"
-                "🤫 Everyone has their own role.\n"
-                "Check your private chat with the bot."
-            ),
-            parse_mode="Markdown",
-        )
-
-        await send_scene_decisions(
-            game_id,
-            context,
-        )
-
-        schedule_resolution(
-            context,
-            game_id,
-            seconds,
-        )
-
-
-# ============================================================
-# TIMER VALIDATION
-# ============================================================
-
-def safe_timer(value: Any) -> int:
     try:
-        seconds = int(value)
-    except (
-        TypeError,
-        ValueError,
-    ):
-        seconds = CONFIG.default_decision_seconds
+        await game_service.start_game(
+            game_id=game_id
+        )
 
-    # Prevent broken AI output from creating
-    # absurdly short/long timers.
-    return max(
-        15,
-        min(seconds, 900),
-    )
+    except Exception as exc:
+        logger.exception(
+            "Could not start game %s.",
+            game_id,
+        )
 
-
-# ============================================================
-# SEND PRIVATE SCENE
-# ============================================================
-
-async def send_scene_decisions(
-    game_id: str,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    game = await db.get_game(
-        game_id
-    )
-
-    if not game:
+        await safe_answer(
+            query,
+            str(exc),
+            show_alert=True,
+        )
         return
 
-    if game["status"] != "playing":
+    await publish_current_scene(
+        context,
+        game_id,
+    )
+
+
+# ============================================================
+# PUBLISH SCENE
+# ============================================================
+
+async def publish_current_scene(
+    context: ContextTypes.DEFAULT_TYPE,
+    game_id: str,
+) -> None:
+    game, players = await (
+        game_service.get_game_with_players(
+            game_id
+        )
+    )
+
+    if game.get("status") != "playing":
         return
 
     scene_id = game.get(
@@ -889,32 +526,69 @@ async def send_scene_decisions(
     )
 
     if not scene_id:
+        logger.error(
+            "Game %s is playing without a current scene.",
+            game_id,
+        )
         return
+
+    engine = game_service.engine_for_game(
+        game
+    )
+
+    scene = engine.get_scene(
+        scene_id
+    )
+
+    round_number = int(
+        game.get(
+            "current_round",
+            0,
+        )
+        or 0
+    )
+
+    timer_seconds = engine.timer_seconds(
+        scene
+    )
+
+    title = story_title(game)
+    public_text = scene_public_text(scene)
 
     try:
-        engine = GameEngine(
-            game["story"]
+        await context.bot.send_message(
+            chat_id=int(game["chat_id"]),
+            text=(
+                f"🎬 **{title}**\n\n"
+                f"**Round {round_number}**\n\n"
+                f"{public_text}\n\n"
+                f"⏳ Decision window: "
+                f"{format_seconds(timer_seconds)}"
+            ),
+            parse_mode="Markdown",
         )
-        scene = engine.get_scene(
-            scene_id
-        )
-    except Exception:
+    except TelegramError:
         logger.exception(
-            "Could not load scene."
+            "Could not publish scene for game %s.",
+            game_id,
         )
-        return
 
-    players = await db.get_players(
-        game_id
-    )
-
-    current_round = int(
-        game["current_round"]
-    )
+    # --------------------------------------------------------
+    # PRIVATE PLAYER DECISIONS
+    # --------------------------------------------------------
 
     for player in players:
+        status = game_service.player_status(
+            player
+        )
 
-        if not player.get("active"):
+        if status != game_service.PLAYER_ACTIVE:
+            continue
+
+        if not game_service.is_required_for_round(
+            player,
+            round_number,
+        ):
             continue
 
         role_id = player.get(
@@ -922,164 +596,136 @@ async def send_scene_decisions(
         )
 
         if not role_id:
+            logger.error(
+                "Player %s has no role.",
+                player.get("user_id"),
+            )
             continue
 
-        # A late joiner does not participate
-        # in the current round.
-        joined_round = int(
-            player.get(
-                "joined_round",
-                0,
+        try:
+            choices = engine.choices_for_role(
+                scene,
+                str(role_id),
+                game.get("world_state")
+                or engine.initial_world_state(),
             )
-        )
+        except Exception:
+            logger.exception(
+                "Could not create choices for player %s.",
+                player.get("user_id"),
+            )
+            continue
 
-        if joined_round > current_round:
+        if not choices:
             continue
 
         try:
             role = engine.get_role(
-                role_id
+                str(role_id)
             )
         except Exception:
-            logger.warning(
-                "Unknown role %s",
+            logger.exception(
+                "Could not load role %s.",
                 role_id,
             )
             continue
 
-        choices = engine.choices_for_role(
-            scene,
-            role_id,
-        )
-
-        # If this role isn't involved in this scene,
-        # don't send random buttons.
-        if not choices:
-            continue
-
-        buttons = []
+        keyboard_rows: list[
+            list[InlineKeyboardButton]
+        ] = []
 
         for choice in choices:
-
             choice_id = str(
                 choice["id"]
             )
 
-            callback_data = (
+            callback = (
                 f"choose:"
                 f"{game_id}:"
-                f"{current_round}:"
+                f"{round_number}:"
                 f"{choice_id}"
             )
 
-            # Telegram callback_data has a 64-byte limit.
             if len(
-                callback_data.encode("utf-8")
+                callback.encode("utf-8")
             ) > 64:
-
                 logger.error(
-                    "Choice callback is too long "
-                    "for Telegram: %s",
-                    callback_data,
+                    "Telegram callback_data too long: %s",
+                    callback,
                 )
-
                 continue
 
-            buttons.append(
+            keyboard_rows.append(
                 [
                     InlineKeyboardButton(
                         str(
                             choice.get(
                                 "label",
-                                "Choose",
+                                choice_id,
                             )
                         ),
-                        callback_data=callback_data,
+                        callback_data=callback,
                     )
                 ]
             )
 
-        if not buttons:
+        if not keyboard_rows:
             continue
 
-        seconds = safe_timer(
-            scene.get(
-                "timer_seconds"
-            )
+        secret_description = role.get(
+            "secret_description",
+            "",
         )
 
-        private_text = (
+        role_name = role.get(
+            "name",
+            "Unknown",
+        )
+
+        text = (
             "🤫 **YOUR SECRET ROLE**\n\n"
-            f"**{role.get('name', 'Unknown')}**\n\n"
-            f"{role.get('secret_description', '')}\n\n"
+            f"**{role_name}**\n\n"
+            f"{secret_description}\n\n"
             "━━━━━━━━━━━━━━\n\n"
-            f"⏳ You have about {format_seconds(seconds)}.\n\n"
+            f"⏳ You have about "
+            f"{format_seconds(timer_seconds)}.\n\n"
             "**WHAT DO YOU DO?**"
         )
 
-        success = await send_private(
+        dm_ok = await send_private(
             context,
             int(player["user_id"]),
-            private_text,
+            text,
             InlineKeyboardMarkup(
-                buttons
+                keyboard_rows
             ),
         )
 
-        if not success:
-            # Don't immediately eliminate them.
-            # They may have temporarily blocked the bot
-            # or Telegram may reject the DM.
-            #
-            # Their missed-decision counter is handled
-            # when the round resolves.
+        if not dm_ok:
             logger.info(
-                "Player %s did not receive private scene.",
+                "Player %s has no accessible private chat.",
                 player["user_id"],
             )
 
 
-def format_seconds(
-    seconds: int,
-) -> str:
-
-    if seconds < 60:
-        return f"{seconds} seconds"
-
-    minutes = seconds // 60
-    remaining = seconds % 60
-
-    if remaining == 0:
-        return (
-            f"{minutes} minute"
-            f"{'s' if minutes != 1 else ''}"
-        )
-
-    return (
-        f"{minutes}m {remaining}s"
-    )
-
-
 # ============================================================
-# PLAYER CHOICE
+# CHOICE
 # ============================================================
 
 async def choose(
-    query,
+    query: Any,
     context: ContextTypes.DEFAULT_TYPE,
     game_id: str,
-    round_number: int,
+    callback_round: int,
     choice_id: str,
-):
+) -> None:
     user = query.from_user
 
-    # The callback originates from the player's
-    # private message, so user identity is reliable.
-    game = await db.get_game(
-        game_id
-    )
-
-    if not game:
+    try:
+        game = await game_service.get_game(
+            game_id
+        )
+    except Exception:
         await safe_answer(
             query,
             "Game not found.",
@@ -1087,734 +733,236 @@ async def choose(
         )
         return
 
-    if game["status"] != "playing":
-        await safe_answer(
-            query,
-            "The game is not accepting decisions.",
-            show_alert=True,
-        )
-        return
-
     current_round = int(
-        game["current_round"]
-    )
-
-    if current_round != round_number:
-        await safe_answer(
-            query,
-            "That decision is already closed.",
-            show_alert=True,
-        )
-        return
-
-    deadline = parse_iso(
         game.get(
-            "decision_deadline"
-        )
-    )
-
-    if deadline and now_utc() >= deadline:
-        await safe_answer(
-            query,
-            "⏰ Too late. The decision has closed.",
-            show_alert=True,
-        )
-
-        # Try to resolve immediately.
-        await maybe_resolve_round(
-            game_id,
-            context,
-            force=True,
-        )
-        return
-
-    player = await db.get_player(
-        game_id,
-        user.id,
-    )
-
-    if not player:
-        await safe_answer(
-            query,
-            "You're not part of this game.",
-            show_alert=True,
-        )
-        return
-
-    if not player.get("active"):
-        await safe_answer(
-            query,
-            "Your character has exited the game.",
-            show_alert=True,
-        )
-        return
-
-    joined_round = int(
-        player.get(
-            "joined_round",
+            "current_round",
             0,
         )
+        or 0
     )
 
-    if joined_round > current_round:
+    if callback_round != current_round:
         await safe_answer(
             query,
-            "Your character enters next round.",
+            "⏰ That decision belongs to an old round.",
             show_alert=True,
         )
         return
 
-    # Validate the choice against the CURRENT scene
-    # before saving anything.
-    try:
-        engine = GameEngine(
-            game["story"]
-        )
-
-        scene = engine.get_scene(
-            game["current_scene_id"]
-        )
-
-        role_id = player.get(
-            "role_id"
-        )
-
-        if not role_id:
-            await safe_answer(
-                query,
-                "Your role has not been assigned.",
-                show_alert=True,
-            )
-            return
-
-        valid_choices = (
-            engine.choices_for_role(
-                scene,
-                role_id,
-            )
-        )
-
-        valid_ids = {
-            str(choice["id"])
-            for choice in valid_choices
-        }
-
-        if choice_id not in valid_ids:
-            await safe_answer(
-                query,
-                "That button is not valid anymore.",
-                show_alert=True,
-            )
-            return
-
-    except Exception:
-        logger.exception(
-            "Choice validation failed."
-        )
-
+    if game.get("status") != "playing":
         await safe_answer(
             query,
-            "I couldn't validate that choice.",
+            "This game is no longer accepting decisions.",
             show_alert=True,
         )
         return
 
-    # Save the decision.
     try:
-        await db.save_decision(
+        result = await game_service.submit_decision(
             game_id=game_id,
-            round_number=round_number,
-            scene_id=game["current_scene_id"],
             user_id=user.id,
             choice_id=choice_id,
         )
 
     except Exception as exc:
-        logger.exception(
-            "Could not save decision."
+        logger.info(
+            "Decision rejected: game=%s user=%s: %s",
+            game_id,
+            user.id,
+            exc,
         )
 
         await safe_answer(
             query,
-            "Your choice could not be saved. Try again.",
+            str(exc),
+            show_alert=True,
+        )
+        return
+
+    if result.get("duplicate"):
+        await safe_answer(
+            query,
+            "You already made your decision.",
             show_alert=True,
         )
         return
 
     await safe_answer(
         query,
-        "✅ Choice locked in.",
-        show_alert=True,
+        "✅ Decision recorded.",
     )
 
-    # Remove buttons so the player doesn't accidentally
-    # press the same decision repeatedly.
+    # Disable the decision buttons in the player's message.
     try:
         await query.edit_message_reply_markup(
             reply_markup=None
         )
-    except BadRequest:
-        pass
     except TelegramError:
         pass
 
-    # Don't necessarily resolve immediately.
-    #
-    # If everybody has chosen, resolve now.
-    # Otherwise the game waits until timer expiry.
-    await maybe_resolve_round(
-        game_id,
-        context,
-        force=False,
+    resolution = result.get(
+        "resolution"
     )
 
+    if resolution and resolution.get(
+        "resolved"
+    ):
+        await publish_resolution(
+            context,
+            game_id,
+            resolution,
+        )
+
 
 # ============================================================
-# ROUND RESOLUTION
+# PUBLISH ROUND RESULT
 # ============================================================
 
-async def maybe_resolve_round(
-    game_id: str,
+async def publish_resolution(
     context: ContextTypes.DEFAULT_TYPE,
-    force: bool,
-):
-    lock = get_game_lock(game_id)
+    game_id: str,
+    resolution: dict[str, Any],
+) -> None:
+    if resolution.get(
+        "already_claimed"
+    ):
+        return
 
-    async with lock:
+    result = resolution.get(
+        "result"
+    )
 
-        game = await db.get_game(
-            game_id
+    if not isinstance(
+        result,
+        dict,
+    ):
+        return
+
+    game = await db.get_game(
+        game_id
+    )
+
+    if not game:
+        return
+
+    ending = result.get(
+        "ending"
+    )
+
+    if ending:
+        ending_title = ending.get(
+            "title",
+            "The End",
         )
 
-        if not game:
-            return
-
-        if game["status"] != "playing":
-            return
-
-        current_round = int(
-            game["current_round"]
+        ending_text = ending.get(
+            "text",
+            "The story has ended.",
         )
-
-        players = await db.get_players(
-            game_id
-        )
-
-        active_players = []
-
-        for player in players:
-
-            if not player.get("active"):
-                continue
-
-            if not player.get("role_id"):
-                continue
-
-            joined_round = int(
-                player.get(
-                    "joined_round",
-                    0,
-                )
-            )
-
-            if joined_round <= current_round:
-                active_players.append(
-                    player
-                )
-
-        decisions = (
-            await db.get_round_decisions(
-                game_id,
-                current_round,
-            )
-        )
-
-        chosen_user_ids = {
-            int(decision["user_id"])
-            for decision in decisions
-            if decision.get("choice_id")
-        }
-
-        # If timer has not expired, we can finish early
-        # only when everyone involved has selected.
-        if not force:
-
-            everyone_chosen = all(
-                int(player["user_id"])
-                in chosen_user_ids
-                for player in active_players
-            )
-
-            if not everyone_chosen:
-                return
-
-        # We need at least one decision.
-        #
-        # If absolutely nobody decided, don't let an empty
-        # round randomly control the story.
-        if not decisions:
-
-            await end_game(
-                game_id,
-                context,
-                "⏰ Nobody made a decision.\n\n"
-                "The story ended before anyone "
-                "could change it.",
-            )
-            return
 
         try:
-            engine = GameEngine(
-                game["story"]
-            )
-
-            scene = engine.get_scene(
-                game["current_scene_id"]
-            )
-
-        except Exception:
-            logger.exception(
-                "Could not load scene during resolution."
-            )
-
-            await end_game(
-                game_id,
-                context,
-                "⚠️ The story engine encountered "
-                "an invalid scene.",
-            )
-            return
-
-        results: list[dict[str, Any]] = []
-
-        # Resolve every submitted decision.
-        for decision in decisions:
-
-            choice_id = decision.get(
-                "choice_id"
-            )
-
-            if not choice_id:
-                continue
-
-            try:
-                result = engine.resolve_choice(
-                    scene,
-                    str(choice_id),
-                    round_number=current_round,
-                )
-
-                # Keep player identity attached to the
-                # result for future world-state support.
-                result["user_id"] = int(
-                    decision["user_id"]
-                )
-
-                results.append(result)
-
-            except Exception:
-                logger.exception(
-                    "Failed resolving choice %s",
-                    choice_id,
-                )
-
-        # ====================================================
-        # MISSING DECISIONS
-        # ====================================================
-
-        for player in active_players:
-
-            user_id = int(
-                player["user_id"]
-            )
-
-            if user_id in chosen_user_ids:
-                continue
-
-            missed = (
-                int(
-                    player.get(
-                        "missed_decisions",
-                        0,
-                    )
-                )
-                + 1
-            )
-
-            if missed >= 3:
-
-                # IMPORTANT:
-                #
-                # The player exits, but the character does
-                # NOT disappear from the story.
-                #
-                # Future story logic can treat the character
-                # as an NPC.
-                await db.update_player(
-                    game_id,
-                    user_id,
-                    {
-                        "missed_decisions": missed,
-                        "active": False,
-                    },
-                )
-
-                await context.bot.send_message(
-                    chat_id=game["chat_id"],
-                    text=(
-                        f"👻 {player['display_name']} "
-                        "has missed 3 decisions.\n\n"
-                        "Their player has exited.\n"
-                        "Their character remains in the story "
-                        "as an NPC."
-                    ),
-                )
-
-            else:
-
-                await db.update_player(
-                    game_id,
-                    user_id,
-                    {
-                        "missed_decisions": missed,
-                    },
-                )
-
-                # Private warning.
-                await send_private(
-                    context,
-                    user_id,
-                    (
-                        "⏰ You missed this decision.\n\n"
-                        f"Missed decisions: {missed}/3\n\n"
-                        "Your character is still in the story."
-                    ),
-                )
-
-        # ====================================================
-        # MARK ROUND RESOLVED
-        # ====================================================
-
-        await db.resolve_round(
-            game_id,
-            current_round,
-        )
-
-        if not results:
-
-            await end_game(
-                game_id,
-                context,
-                "Nobody made a valid choice.\n\n"
-                "The story took its own path.",
-            )
-            return
-
-        # ====================================================
-        # PUBLIC CONSEQUENCES
-        # ====================================================
-
-        public_events = []
-
-        for result in results:
-
-            event = result.get(
-                "public_event"
-            )
-
-            if event:
-                public_events.append(
-                    str(event)
-                )
-
-        if public_events:
-
-            public_text = (
-                "💥 **WHAT HAPPENS?**\n\n"
-            )
-
-            public_text += "\n\n".join(
-                f"• {event}"
-                for event in public_events
-            )
-
             await context.bot.send_message(
-                chat_id=game["chat_id"],
-                text=public_text,
+                chat_id=int(game["chat_id"]),
+                text=(
+                    "🎭 **WHAT HAPPENS? — THE END**\n\n"
+                    f"**{ending_title}**\n\n"
+                    f"{ending_text}"
+                ),
                 parse_mode="Markdown",
             )
+        except TelegramError:
+            logger.exception(
+                "Could not publish ending."
+            )
 
-        # ====================================================
-        # DETERMINE NEXT SCENE
-        # ====================================================
+        return
 
-        try:
-            next_scene_id = (
-                engine.next_scene_from_results(
-                    scene,
-                    results,
+    events = result.get(
+        "events",
+        []
+    )
+
+    public_events: list[str] = []
+
+    if isinstance(events, list):
+        for event in events:
+            if not isinstance(
+                event,
+                dict,
+            ):
+                continue
+
+            text = event.get(
+                "public_text"
+            ) or event.get(
+                "text"
+            )
+
+            if text:
+                public_events.append(
+                    str(text)
                 )
-            )
-        except Exception:
-            logger.exception(
-                "Branch resolution failed."
-            )
-            next_scene_id = None
 
-        # No next scene means this story ended.
-        if not next_scene_id:
-
-            await end_game(
-                game_id,
-                context,
-                "And somehow...\n\n"
-                "that was the end.",
-            )
-            return
-
+    if public_events:
         try:
-            next_scene = engine.get_scene(
-                next_scene_id
+            await context.bot.send_message(
+                chat_id=int(game["chat_id"]),
+                text=(
+                    "💥 **WHAT HAPPENS?**\n\n"
+                    + "\n\n".join(
+                        f"• {event}"
+                        for event in public_events
+                    )
+                ),
+                parse_mode="Markdown",
             )
-        except Exception:
+        except TelegramError:
             logger.exception(
-                "Next scene %s does not exist.",
-                next_scene_id,
+                "Could not publish public events."
             )
 
-            await end_game(
-                game_id,
-                context,
-                "⚠️ The story reached an invalid ending.",
-            )
-            return
-
-        next_round = current_round + 1
-
-        seconds = safe_timer(
-            next_scene.get(
-                "timer_seconds"
-            )
-        )
-
-        deadline = (
-            now_utc()
-            + timedelta(
-                seconds=seconds
-            )
-        )
-
-        await db.update_game(
-            game_id,
-            {
-                "current_scene_id": next_scene_id,
-                "current_round": next_round,
-                "decision_deadline": iso(
-                    deadline
-                ),
-                "updated_at": iso(
-                    now_utc()
-                ),
-            },
-        )
-
-        public_text = next_scene.get(
-            "public_text",
-            "Something else is happening...",
-        )
-
-        await context.bot.send_message(
-            chat_id=game["chat_id"],
-            text=(
-                f"🎬 **Round {next_round}**\n\n"
-                f"{public_text}\n\n"
-                f"⏳ Decision window: "
-                f"{format_seconds(seconds)}"
-            ),
-            parse_mode="Markdown",
-        )
-
-        # Send each active player their own role-specific
-        # private buttons.
-        await send_scene_decisions(
-            game_id,
-            context,
-        )
-
-        schedule_resolution(
-            context,
-            game_id,
-            seconds,
-        )
-
-
-# ============================================================
-# TIMER JOBS
-# ============================================================
-
-def schedule_resolution(
-    context: ContextTypes.DEFAULT_TYPE,
-    game_id: str,
-    seconds: int,
-):
-    """
-    Schedule a timeout job.
-
-    We still re-check the database deadline when the job fires,
-    so stale jobs cannot resolve a newer round.
-    """
-
-    context.job_queue.run_once(
-        resolve_timeout_job,
-        when=max(1, seconds),
-        data={
-            "game_id": game_id,
-        },
-        name=f"resolve:{game_id}",
+    next_scene_id = result.get(
+        "next_scene"
     )
 
-
-async def resolve_timeout_job(
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    data = context.job.data or {}
-
-    game_id = data.get(
-        "game_id"
-    )
-
-    if not game_id:
+    if not next_scene_id:
         return
 
-    game = await db.get_game(
+    # The database has already committed the next scene.
+    # Re-read it rather than trusting transient result state.
+    refreshed = await db.get_game(
         game_id
     )
 
-    if not game:
+    if not refreshed:
         return
 
-    if game["status"] != "playing":
+    if refreshed.get("status") != "playing":
         return
 
-    deadline = parse_iso(
-        game.get(
-            "decision_deadline"
-        )
-    )
-
-    if deadline:
-
-        remaining = (
-            deadline - now_utc()
-        ).total_seconds()
-
-        # A job may have been restored slightly early.
-        if remaining > 0.5:
-
-            context.job_queue.run_once(
-                resolve_timeout_job,
-                when=remaining,
-                data={
-                    "game_id": game_id,
-                },
-                name=f"resolve:{game_id}",
-            )
-
-            return
-
-    await maybe_resolve_round(
-        game_id,
+    await publish_current_scene(
         context,
-        force=True,
-    )
-
-
-# ============================================================
-# AUTOMATIC LOBBY START
-# ============================================================
-
-async def begin_game_job(
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    data = context.job.data or {}
-
-    game_id = data.get(
-        "game_id"
-    )
-
-    if not game_id:
-        return
-
-    game = await db.get_game(
-        game_id
-    )
-
-    if not game:
-        return
-
-    if game["status"] != "lobby":
-        return
-
-    await start_game(
         game_id,
-        context,
     )
 
 
 # ============================================================
-# RECOVER GAMES AFTER BOT RESTART
-# ============================================================
-
-async def recover_active_games(
-    application: Application,
-):
-    """
-    Telegram JobQueue lives in RAM.
-
-    If the bot restarts, the database still knows which games
-    are active, but their timers have disappeared.
-
-    This function rebuilds the missing timers.
-    """
-
-    logger.info(
-        "Checking for games that need timer recovery..."
-    )
-
-    # The current Database class exposes get_active_game
-    # by chat rather than a global active-games query.
-    #
-    # Therefore recovery is intentionally conservative.
-    #
-    # For a larger deployment, add a DB method that returns
-    # all lobby/playing games in one query.
-    #
-    # This startup hook is kept so the architecture has one
-    # place for recovery when that method is added.
-
-    logger.info(
-        "Timer recovery hook initialized."
-    )
-
-
-# ============================================================
-# STOP COMMAND
+# /STOP
 # ============================================================
 
 async def stop(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-):
-    if not update.effective_chat:
-        return
-
-    if not update.effective_message:
-        return
-
+) -> None:
+    message = update.effective_message
     chat = update.effective_chat
+    user = update.effective_user
+
+    if not message or not chat or not user:
+        return
 
     if chat.type == ChatType.PRIVATE:
-        await update.effective_message.reply_text(
+        await message.reply_text(
             "Use /stop inside the group."
         )
         return
@@ -1824,129 +972,56 @@ async def stop(
     )
 
     if not game:
-        await update.effective_message.reply_text(
+        await message.reply_text(
             "There is no active WHAT HAPPENS? game."
         )
         return
 
-    user = update.effective_user
-
-    if not user:
-        return
-
-    allowed = await can_stop_game(
-        context,
-        game,
-        user.id,
+    allowed = (
+        int(game["creator_id"]) == user.id
+        or user.id in CONFIG.admin_user_ids
     )
 
     if not allowed:
+        try:
+            member = await context.bot.get_chat_member(
+                chat_id=chat.id,
+                user_id=user.id,
+            )
 
-        await update.effective_message.reply_text(
-            "Only the game creator or a group "
-            "administrator can stop the game."
+            allowed = member.status in {
+                "administrator",
+                "creator",
+            }
+
+        except TelegramError:
+            allowed = False
+
+    if not allowed:
+        await message.reply_text(
+            "Only the game creator or a group administrator "
+            "can stop the game."
         )
         return
 
-    await end_game(
-        game["id"],
-        context,
-        "🛑 The game was stopped by "
-        "the game creator or a group administrator.",
-    )
-
-
-# ============================================================
-# END GAME
-# ============================================================
-
-async def end_game(
-    game_id: str,
-    context: ContextTypes.DEFAULT_TYPE,
-    reason: str,
-):
-    lock = get_game_lock(game_id)
-
-    async with lock:
-
-        game = await db.get_game(
-            game_id
-        )
-
-        if not game:
-            return
-
-        if game["status"] == "ended":
-            return
-
-        await db.update_game(
-            game_id,
-            {
-                "status": "ended",
-                "ended_at": iso(
-                    now_utc()
-                ),
-                "updated_at": iso(
-                    now_utc()
-                ),
-            },
-        )
-
-        # Remove scheduled jobs for this game.
-        remove_game_jobs(
-            context,
-            game_id,
-        )
-
-        try:
-            await context.bot.send_message(
-                chat_id=game["chat_id"],
-                text=(
-                    "🎭 **WHAT HAPPENS? — END**\n\n"
-                    f"{reason}\n\n"
-                    "No leaderboard.\n"
-                    "No score.\n"
-                    "No winner.\n\n"
-                    "🔄 Use /play for another story."
-                ),
-                parse_mode="Markdown",
-            )
-        except TelegramError:
-            pass
-
-
-def remove_game_jobs(
-    context: ContextTypes.DEFAULT_TYPE,
-    game_id: str,
-):
-    """
-    Remove pending jobs belonging to this game.
-
-    JobQueue APIs can vary slightly by python-telegram-bot
-    version, so this uses get_jobs_by_name when available.
-    """
-
     try:
-
-        names = {
-            f"begin:{game_id}",
-            f"resolve:{game_id}",
-        }
-
-        for name in names:
-
-            jobs = context.job_queue.get_jobs_by_name(
-                name
-            )
-
-            for job in jobs:
-                job.schedule_removal()
-
-    except Exception:
-        logger.debug(
-            "Could not remove game jobs.",
-            exc_info=True,
+        await db.cancel_game_atomic(
+            game["id"]
         )
+    except Exception:
+        logger.exception(
+            "Could not cancel game %s.",
+            game["id"],
+        )
+
+        await message.reply_text(
+            "⚠️ I couldn't stop the game safely."
+        )
+        return
+
+    await message.reply_text(
+        "🛑 The WHAT HAPPENS? game has been stopped."
+    )
 
 
 # ============================================================
@@ -1956,7 +1031,7 @@ def remove_game_jobs(
 async def callback_router(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-):
+) -> None:
     query = update.callback_query
 
     if not query:
@@ -1965,29 +1040,19 @@ async def callback_router(
     data = query.data or ""
 
     try:
-
         parts = data.split(":")
 
-        if not parts:
-            await safe_answer(
-                query,
-                "Invalid button.",
-                show_alert=True,
-            )
-            return
-
-        action = parts[0]
+        action = parts[0] if parts else ""
 
         # ----------------------------------------------------
         # JOIN
         # ----------------------------------------------------
 
         if action == "join":
-
             if len(parts) != 2:
                 await safe_answer(
                     query,
-                    "Invalid join button.",
+                    "Invalid JOIN button.",
                     show_alert=True,
                 )
                 return
@@ -1997,7 +1062,6 @@ async def callback_router(
                 context,
                 parts[1],
             )
-
             return
 
         # ----------------------------------------------------
@@ -2005,11 +1069,10 @@ async def callback_router(
         # ----------------------------------------------------
 
         if action == "begin":
-
             if len(parts) != 2:
                 await safe_answer(
                     query,
-                    "Invalid start button.",
+                    "Invalid START button.",
                     show_alert=True,
                 )
                 return
@@ -2019,15 +1082,13 @@ async def callback_router(
                 context,
                 parts[1],
             )
-
             return
 
         # ----------------------------------------------------
-        # CHOICE
+        # CHOOSE
         # ----------------------------------------------------
 
         if action == "choose":
-
             if len(parts) < 4:
                 await safe_answer(
                     query,
@@ -2043,7 +1104,6 @@ async def callback_router(
                     parts[2]
                 )
             except ValueError:
-
                 await safe_answer(
                     query,
                     "Invalid round.",
@@ -2051,9 +1111,6 @@ async def callback_router(
                 )
                 return
 
-            # Choice IDs normally do not contain ":".
-            # Joining the remainder keeps this robust if
-            # the generator ever creates one.
             choice_id = ":".join(
                 parts[3:]
             )
@@ -2065,7 +1122,6 @@ async def callback_router(
                 round_number,
                 choice_id,
             )
-
             return
 
         await safe_answer(
@@ -2076,7 +1132,7 @@ async def callback_router(
 
     except Exception:
         logger.exception(
-            "Unhandled callback error."
+            "Unhandled Telegram callback."
         )
 
         await safe_answer(
@@ -2087,13 +1143,13 @@ async def callback_router(
 
 
 # ============================================================
-# ERROR HANDLER
+# TELEGRAM ERROR HANDLER
 # ============================================================
 
 async def error_handler(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
-):
+) -> None:
     logger.error(
         "Unhandled Telegram error: %s",
         context.error,
@@ -2102,39 +1158,54 @@ async def error_handler(
 
 
 # ============================================================
-# POST INIT
+# STARTUP / RECOVERY
 # ============================================================
 
-async def post_init(
-    application: Application,
-):
+async def recover_active_games() -> None:
+    """
+    Recover persistent state after a Render restart.
+
+    There is intentionally no JobQueue timer here.
+
+    Game deadlines live in Supabase. The upcoming main.py
+    runtime recovery loop will periodically call this method,
+    which resolves games whose database deadline has expired.
+    """
+
     logger.info(
-        "YourOwnVision WHAT HAPPENS? started."
+        "Recovering active WHAT HAPPENS? games from Supabase..."
     )
+
+    results = await game_service.recover_all_due_games()
 
     logger.info(
-        "Gemini is used for story preparation only."
-    )
-
-    await recover_active_games(
-        application
+        "Recovery completed. Processed %s game state(s).",
+        len(results),
     )
 
 
 # ============================================================
-# MAIN
+# APPLICATION FACTORY
 # ============================================================
 
-def main():
+def create_application() -> Application:
+    """
+    Create the Telegram application.
+
+    IMPORTANT:
+
+    This function does NOT call run_polling().
+
+    main.py owns the HTTP server and feeds Telegram webhook
+    updates into this Application instance.
+    """
 
     application = (
         Application.builder()
         .token(CONFIG.telegram_token)
-        .post_init(post_init)
         .build()
     )
 
-    # Commands
     application.add_handler(
         CommandHandler(
             "start",
@@ -2156,7 +1227,6 @@ def main():
         )
     )
 
-    # Inline buttons
     application.add_handler(
         CallbackQueryHandler(
             callback_router,
@@ -2167,14 +1237,32 @@ def main():
         error_handler
     )
 
-    logger.info(
-        "Polling started."
+    return application
+
+
+# ============================================================
+# WEBHOOK UPDATE PROCESSOR
+# ============================================================
+
+async def process_update(
+    application: Application,
+    update: Update,
+) -> None:
+    """
+    Feed one Telegram webhook update into python-telegram-bot.
+
+    FastAPI/main.py owns the HTTP endpoint.
+    """
+
+    await application.process_update(
+        update
     )
 
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES
-    )
 
-
-if __name__ == "__main__":
-    main()
+__all__ = [
+    "db",
+    "game_service",
+    "create_application",
+    "process_update",
+    "recover_active_games",
+]
