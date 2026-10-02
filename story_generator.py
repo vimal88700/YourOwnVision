@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
+import random
+import re
 from typing import Any
 
 from google import genai
@@ -13,6 +17,10 @@ from story_validator import StoryValidationError, StoryValidator
 
 logger = logging.getLogger("YourOwnVision.story_generator")
 
+
+# ============================================================
+# GEMINI OUTPUT MODELS
+# ============================================================
 
 class GeneratedSecret(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -156,7 +164,6 @@ class GeneratedScene(BaseModel):
 
     id: str
     public_text: str
-
     timer_seconds: int
 
     eligible_roles: list[str] = Field(
@@ -188,20 +195,33 @@ class GeneratedStory(BaseModel):
     scenes: list[GeneratedScene]
 
 
+# ============================================================
+# STORY GENERATOR
+# ============================================================
+
 class StoryGenerator:
     """
     Generates story content with Gemini.
 
-    Gemini prepares story data only.
-
+    Gemini generates story data only.
     Gameplay is handled by GameEngine.
     """
 
+    # Primary model.
     DEFAULT_MODEL = "gemini-3.8-flash"
 
+    # Safe fallback chain.
     FALLBACK_MODELS = (
-    "gemini-3.8-flash",
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
     )
+
+    # Retry settings.
+    MAX_RETRIES_PER_REQUEST = 4
+    INITIAL_RETRY_DELAY_SECONDS = 2.0
+    MAX_RETRY_DELAY_SECONDS = 20.0
 
     MIN_PLAYERS = 1
     MAX_PLAYERS = 20
@@ -232,9 +252,16 @@ class StoryGenerator:
                 "Gemini model cannot be empty."
             )
 
+        # Remove accidental models/ prefix.
+        self.model = self.model.removeprefix("models/")
+
         self.client = genai.Client(
             api_key=api_key.strip()
         )
+
+    # ========================================================
+    # PUBLIC GENERATE METHOD
+    # ========================================================
 
     async def generate(
         self,
@@ -257,148 +284,112 @@ class StoryGenerator:
 
         last_api_error: Exception | None = None
 
-        models_to_try: list[str] = []
-
-        for candidate in (
-            self.model,
-            *self.FALLBACK_MODELS,
-        ):
-            candidate = candidate.strip()
-
-            if (
-                candidate
-                and candidate not in models_to_try
-            ):
-                models_to_try.append(candidate)
-
         response = None
 
-        # ---------------------------------------------------------
-        # FIRST ATTEMPT
-        # Gemini structured JSON + Pydantic schema
-        # ---------------------------------------------------------
+        models_to_try = self._get_models_to_try()
+
+        # ====================================================
+        # ATTEMPT 1:
+        # STRUCTURED JSON + PYDANTIC SCHEMA
+        # ====================================================
 
         for model_name in models_to_try:
-
             try:
-
-                logger.info(
-                    "Generating story with Gemini "
-                    "model=%s players=%s",
-                    model_name,
-                    player_count,
-                )
-
-                response = (
-                    await self.client.aio.models.generate_content(
-                        model=model_name,
-                        contents=prompt,
-                        config=types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            response_schema=GeneratedStory,
-                            system_instruction=(
-                                "You are the story-content "
-                                "generator for the WHAT HAPPENS? "
-                                "Telegram game. "
-                                "Generate story data only. "
-                                "Never generate executable code, "
-                                "Telegram API calls, SQL, "
-                                "or gameplay decisions."
-                            ),
-                            temperature=0.8,
+                response = await self._generate_with_retry(
+                    model_name=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=GeneratedStory,
+                        system_instruction=(
+                            "You are the story-content generator "
+                            "for the WHAT HAPPENS? Telegram game. "
+                            "Generate story data only. "
+                            "Never generate executable code, "
+                            "Telegram API calls, SQL, or gameplay "
+                            "decisions."
                         ),
-                    )
+                    ),
+                    mode="structured",
                 )
 
                 self.model = model_name
 
                 logger.info(
-                    "Gemini structured story generation "
-                    "succeeded with model=%s",
+                    "Gemini structured generation succeeded "
+                    "using model=%s",
                     model_name,
                 )
 
                 break
 
             except Exception as exc:
-
                 last_api_error = exc
 
-                logger.exception(
-                    "Structured Gemini story generation "
-                    "failed with model=%s: %s",
+                logger.warning(
+                    "Structured Gemini generation failed "
+                    "for model=%s: %s",
                     model_name,
                     exc,
                 )
 
-        # ---------------------------------------------------------
-        # SECOND ATTEMPT
-        # Plain JSON without response_schema
-        # ---------------------------------------------------------
+        # ====================================================
+        # ATTEMPT 2:
+        # PLAIN JSON FALLBACK
+        # ====================================================
 
         if response is None:
 
             for model_name in models_to_try:
 
                 try:
-
-                    logger.warning(
-                        "Retrying Gemini story generation "
-                        "without response_schema. model=%s",
-                        model_name,
-                    )
-
-                    response = (
-                        await self.client.aio.models.generate_content(
-                            model=model_name,
-                            contents=(
-                                prompt
-                                + "\n\n"
-                                "IMPORTANT:\n"
-                                "Return ONLY one valid JSON "
-                                "object.\n"
-                                "Do NOT use Markdown fences.\n"
-                                "Do NOT add explanations.\n"
-                                "Do NOT add commentary."
+                    response = await self._generate_with_retry(
+                        model_name=model_name,
+                        contents=(
+                            prompt
+                            + "\n\n"
+                            "IMPORTANT:\n"
+                            "Return ONLY one valid JSON object.\n"
+                            "Do NOT use Markdown fences.\n"
+                            "Do NOT add explanations.\n"
+                            "Do NOT add commentary."
+                        ),
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            system_instruction=(
+                                "Return only one valid JSON "
+                                "object matching the requested "
+                                "story structure. "
+                                "No Markdown. "
+                                "No commentary."
                             ),
-                            config=types.GenerateContentConfig(
-                                response_mime_type="application/json",
-                                system_instruction=(
-                                    "Return only a single valid "
-                                    "JSON object matching the "
-                                    "requested story structure. "
-                                    "No Markdown. "
-                                    "No commentary."
-                                ),
-                                temperature=0.7,
-                            ),
-                        )
+                        ),
+                        mode="plain-json",
                     )
 
                     self.model = model_name
 
                     logger.info(
-                        "Gemini plain JSON fallback succeeded "
-                        "with model=%s",
+                        "Gemini plain JSON generation succeeded "
+                        "using model=%s",
                         model_name,
                     )
 
                     break
 
                 except Exception as exc:
-
                     last_api_error = exc
 
-                    logger.exception(
+                    logger.warning(
                         "Gemini JSON fallback failed "
-                        "with model=%s: %s",
+                        "for model=%s: %s",
                         model_name,
                         exc,
                     )
 
-        # ---------------------------------------------------------
-        # COMPLETE FAILURE
-        # ---------------------------------------------------------
+        # ====================================================
+        # COMPLETE GEMINI FAILURE
+        # ====================================================
 
         if response is None:
 
@@ -419,9 +410,9 @@ class StoryGenerator:
                 f"{detail}"
             ) from last_api_error
 
-        # ---------------------------------------------------------
-        # READ GEMINI RESPONSE
-        # ---------------------------------------------------------
+        # ====================================================
+        # READ RESPONSE
+        # ====================================================
 
         parsed = getattr(
             response,
@@ -437,29 +428,25 @@ class StoryGenerator:
 
         try:
 
-            # Gemini structured response
+            # Gemini structured response.
             if isinstance(
                 parsed,
                 GeneratedStory,
             ):
-
                 generated = parsed
 
-            # Parsed dictionary/object
+            # Parsed dictionary/object.
             elif parsed is not None:
-
-                generated = (
-                    GeneratedStory.model_validate(
-                        parsed
-                    )
+                generated = GeneratedStory.model_validate(
+                    parsed
                 )
 
-            # Plain JSON response
+            # Plain JSON response.
             elif raw_text:
 
                 cleaned = raw_text.strip()
 
-                # Remove accidental Markdown JSON fences.
+                # Remove accidental Markdown fences.
                 if cleaned.startswith("```"):
 
                     lines = cleaned.splitlines()
@@ -474,8 +461,7 @@ class StoryGenerator:
 
                     if (
                         lines
-                        and lines[-1].strip()
-                        == "```"
+                        and lines[-1].strip() == "```"
                     ):
                         lines = lines[:-1]
 
@@ -483,11 +469,8 @@ class StoryGenerator:
                         lines
                     ).strip()
 
-                generated = (
-                    GeneratedStory
-                    .model_validate_json(
-                        cleaned
-                    )
+                generated = GeneratedStory.model_validate_json(
+                    cleaned
                 )
 
             else:
@@ -499,8 +482,7 @@ class StoryGenerator:
         except ValidationError as exc:
 
             logger.error(
-                "Gemini returned invalid story "
-                "JSON/schema: %s",
+                "Gemini returned invalid story JSON/schema: %s",
                 exc,
             )
 
@@ -509,46 +491,41 @@ class StoryGenerator:
                 "does not match the required schema."
             ) from exc
 
-        # ---------------------------------------------------------
+        # ====================================================
         # CONVERT TO NORMAL DICT
-        # ---------------------------------------------------------
+        # ====================================================
 
         story = generated.model_dump(
             mode="json"
         )
 
-        # ---------------------------------------------------------
-        # YOUR EXISTING STORY VALIDATOR
-        # ---------------------------------------------------------
+        # ====================================================
+        # EXISTING STORY VALIDATOR
+        # ====================================================
 
         try:
 
-            validated_story = (
-                StoryValidator.validate(
-                    story,
-                    player_count=player_count,
-                )
+            validated_story = StoryValidator.validate(
+                story,
+                player_count=player_count,
             )
 
         except StoryValidationError:
-
             raise
 
         except Exception as exc:
 
             logger.exception(
-                "Generated story failed "
-                "semantic validation."
+                "Generated story failed semantic validation."
             )
 
             raise StoryValidationError(
-                "Generated story failed "
-                "semantic validation."
+                "Generated story failed semantic validation."
             ) from exc
 
-        # ---------------------------------------------------------
+        # ====================================================
         # DUPLICATE STORY CHECK
-        # ---------------------------------------------------------
+        # ====================================================
 
         fingerprint = (
             StoryValidator.structural_fingerprint(
@@ -574,6 +551,264 @@ class StoryGenerator:
             validated_story,
             fingerprint,
         )
+
+    # ========================================================
+    # MODEL FALLBACK LIST
+    # ========================================================
+
+    def _get_models_to_try(self) -> list[str]:
+
+        configured_fallbacks = os.getenv(
+            "GEMINI_FALLBACK_MODELS",
+            ",".join(self.FALLBACK_MODELS),
+        )
+
+        candidates = [self.model]
+
+        candidates.extend(
+            item.strip()
+            for item in configured_fallbacks.split(",")
+            if item.strip()
+        )
+
+        models: list[str] = []
+
+        for candidate in candidates:
+
+            candidate = (
+                candidate
+                .removeprefix("models/")
+                .strip()
+            )
+
+            if candidate and candidate not in models:
+                models.append(candidate)
+
+        return models
+
+    # ========================================================
+    # RETRY ERROR DETECTION
+    # ========================================================
+
+    @staticmethod
+    def _is_retryable_error(
+        exc: Exception,
+    ) -> bool:
+
+        text = str(exc).upper()
+
+        retryable_markers = (
+            "429",
+            "RESOURCE_EXHAUSTED",
+            "503",
+            "UNAVAILABLE",
+            "500",
+            "INTERNAL",
+            "502",
+            "504",
+            "DEADLINE_EXCEEDED",
+            "TIMEOUT",
+            "TIMED OUT",
+            "TOO MANY REQUESTS",
+        )
+
+        return any(
+            marker in text
+            for marker in retryable_markers
+        )
+
+    # ========================================================
+    # RETRY-AFTER PARSER
+    # ========================================================
+
+    @staticmethod
+    def _retry_after_seconds(
+        exc: Exception,
+    ) -> float | None:
+
+        for attr in (
+            "retry_after",
+            "retry_delay",
+        ):
+
+            value = getattr(
+                exc,
+                attr,
+                None,
+            )
+
+            if value is not None:
+
+                try:
+
+                    if hasattr(
+                        value,
+                        "total_seconds",
+                    ):
+                        return max(
+                            0.0,
+                            float(
+                                value.total_seconds()
+                            ),
+                        )
+
+                    return max(
+                        0.0,
+                        float(value),
+                    )
+
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+                    pass
+
+        match = re.search(
+            r"retry[- ]after[^0-9]*"
+            r"(\d+(?:\.\d+)?)",
+            str(exc),
+            re.IGNORECASE,
+        )
+
+        if match:
+
+            try:
+                return max(
+                    0.0,
+                    float(match.group(1)),
+                )
+
+            except ValueError:
+                return None
+
+        return None
+
+    # ========================================================
+    # GEMINI REQUEST WITH RETRY / BACKOFF
+    # ========================================================
+
+    async def _generate_with_retry(
+        self,
+        *,
+        model_name: str,
+        contents: str,
+        config: types.GenerateContentConfig,
+        mode: str,
+    ) -> Any:
+
+        last_error: Exception | None = None
+
+        for attempt in range(
+            1,
+            self.MAX_RETRIES_PER_REQUEST + 1,
+        ):
+
+            try:
+
+                logger.info(
+                    "Gemini request: "
+                    "model=%s mode=%s attempt=%d/%d",
+                    model_name,
+                    mode,
+                    attempt,
+                    self.MAX_RETRIES_PER_REQUEST,
+                )
+
+                response = (
+                    await self.client.aio.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=config,
+                    )
+                )
+
+                logger.info(
+                    "Gemini request succeeded: "
+                    "model=%s mode=%s attempt=%d",
+                    model_name,
+                    mode,
+                    attempt,
+                )
+
+                return response
+
+            except Exception as exc:
+
+                last_error = exc
+
+                retryable = self._is_retryable_error(
+                    exc
+                )
+
+                # Do not retry permanent errors such as:
+                # invalid API key, invalid argument, etc.
+                if (
+                    not retryable
+                    or attempt >= self.MAX_RETRIES_PER_REQUEST
+                ):
+
+                    logger.exception(
+                        "Gemini request failed/exhausted: "
+                        "model=%s mode=%s attempt=%d "
+                        "error=%s",
+                        model_name,
+                        mode,
+                        attempt,
+                        exc,
+                    )
+
+                    raise
+
+                retry_after = (
+                    self._retry_after_seconds(exc)
+                )
+
+                if retry_after is not None:
+
+                    delay = min(
+                        retry_after,
+                        self.MAX_RETRY_DELAY_SECONDS,
+                    )
+
+                else:
+
+                    exponential = min(
+                        self.INITIAL_RETRY_DELAY_SECONDS
+                        * (2 ** (attempt - 1)),
+                        self.MAX_RETRY_DELAY_SECONDS,
+                    )
+
+                    jitter = random.uniform(
+                        0.0,
+                        exponential * 0.25,
+                    )
+
+                    delay = min(
+                        exponential + jitter,
+                        self.MAX_RETRY_DELAY_SECONDS,
+                    )
+
+                logger.warning(
+                    "Temporary Gemini error: "
+                    "model=%s mode=%s attempt=%d/%d. "
+                    "Retrying in %.1fs. error=%s",
+                    model_name,
+                    mode,
+                    attempt,
+                    self.MAX_RETRIES_PER_REQUEST,
+                    delay,
+                    exc,
+                )
+
+                await asyncio.sleep(delay)
+
+        assert last_error is not None
+
+        raise last_error
+
+    # ========================================================
+    # PROMPT
+    # ========================================================
 
     def _build_prompt(
         self,
@@ -722,6 +957,10 @@ Previous structural fingerprints:
 Return ONLY the structured JSON object.
 """
 
+    # ========================================================
+    # PLAYER COUNT VALIDATION
+    # ========================================================
+
     @classmethod
     def _validate_player_count(
         cls,
@@ -755,6 +994,10 @@ Return ONLY the structured JSON object.
                 f"{cls.MAX_PLAYERS}."
             )
 
+    # ========================================================
+    # CLIENT CLOSE
+    # ========================================================
+
     async def close(
         self,
     ) -> None:
@@ -784,6 +1027,10 @@ Return ONLY the structured JSON object.
             ):
                 await result
 
+
+# ============================================================
+# ROLE LIMIT
+# ============================================================
 
 def max_roles(
     player_count: int,
