@@ -1,1164 +1,673 @@
-from future import annotations
+from __future__ import annotations
 
+import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from database import (
-Database,
-DatabaseConflict,
-DatabaseError,
+    Database,
+    DatabaseConflict,
+    DatabaseError,
 )
 from engine import GameEngine
 from story_generator import StoryGenerator
 
+
 logger = logging.getLogger("YourOwnVision.game_service")
 
+
 class GameService:
-"""
-Application/game orchestration layer.
-
-Telegram must call this service rather than manipulating
-gameplay state directly.
-
-Architecture:
+    """
+    Application/game orchestration layer.
 
     Telegram
         ↓
     GameService
         ↓
-    Database  ← persistent source of truth
+    Database  ← authoritative persistent state
         ↑
     GameEngine ← deterministic gameplay
         ↑
-    StoryGenerator ← Gemini content preparation only
+    StoryGenerator ← Gemini story preparation only
 
-This class deliberately does NOT:
+    This class never:
 
-    - import Telegram
-    - send Telegram messages
-    - use Telegram polling
-    - keep authoritative state in memory
-    - call Gemini for player decisions
-    - own authoritative timers
+    - imports Telegram
+    - sends Telegram messages
+    - polls Telegram
+    - stores authoritative game state in memory
+    - uses an in-memory timer as the source of truth
+    - calls Gemini for player decisions
+    """
 
-Persistent state belongs in Supabase.
-"""
+    STATUS_LOBBY = "lobby"
+    STATUS_STARTING = "starting"
+    STATUS_PLAYING = "playing"
+    STATUS_RESOLVING = "resolving"
+    STATUS_COMPLETED = "completed"
+    STATUS_CANCELLED = "cancelled"
 
-STATUS_LOBBY = "lobby"
-STATUS_STARTING = "starting"
-STATUS_PLAYING = "playing"
-STATUS_RESOLVING = "resolving"
-STATUS_COMPLETED = "completed"
-STATUS_CANCELLED = "cancelled"
+    PLAYER_PENDING = "pending"
+    PLAYER_ACTIVE = "active"
+    PLAYER_ELIMINATED = "eliminated"
+    PLAYER_NPC = "npc"
+    PLAYER_LEFT = "left"
 
-PLAYER_PENDING = "pending"
-PLAYER_ACTIVE = "active"
-PLAYER_ELIMINATED = "eliminated"
-PLAYER_NPC = "npc"
-PLAYER_LEFT = "left"
+    MAX_PLAYERS = 100
+    MAX_MISSED_DECISIONS = 3
 
-MAX_PLAYERS = 100
+    def __init__(
+        self,
+        db: Database,
+        story_generator: StoryGenerator,
+        *,
+        join_seconds: int = 60,
+        default_decision_seconds: int = 35,
+        minimum_decision_seconds: int = 15,
+        maximum_decision_seconds: int = 900,
+    ) -> None:
+        self.db = db
+        self.story_generator = story_generator
 
-def __init__(
-    self,
-    db: Database,
-    story_generator: StoryGenerator,
-    *,
-    join_seconds: int = 60,
-    default_decision_seconds: int = 35,
-) -> None:
-
-    self.db = db
-    self.story_generator = story_generator
-
-    self.join_seconds = max(
-        1,
-        int(join_seconds),
-    )
-
-    self.default_decision_seconds = max(
-        10,
-        int(default_decision_seconds),
-    )
-
-# ============================================================
-# TIME HELPERS
-# ============================================================
-
-@staticmethod
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-@staticmethod
-def to_iso(value: datetime) -> str:
-    if value.tzinfo is None:
-        value = value.replace(
-            tzinfo=timezone.utc
+        self.join_seconds = max(
+            10,
+            int(join_seconds),
         )
 
-    return value.astimezone(
-        timezone.utc
-    ).isoformat()
+        self.minimum_decision_seconds = max(
+            5,
+            int(minimum_decision_seconds),
+        )
 
-@staticmethod
-def parse_timestamp(
-    value: Any,
-) -> datetime | None:
+        self.maximum_decision_seconds = max(
+            self.minimum_decision_seconds,
+            int(maximum_decision_seconds),
+        )
 
-    if value is None:
-        return None
+        self.default_decision_seconds = min(
+            self.maximum_decision_seconds,
+            max(
+                self.minimum_decision_seconds,
+                int(default_decision_seconds),
+            ),
+        )
 
-    if isinstance(
-        value,
-        datetime,
-    ):
-        result = value
+    # ============================================================
+    # TIME
+    # ============================================================
 
-    elif isinstance(
-        value,
-        str,
-    ):
-        try:
-            result = datetime.fromisoformat(
-                value.replace(
-                    "Z",
-                    "+00:00",
-                )
+    @staticmethod
+    def now_utc() -> datetime:
+        return datetime.now(timezone.utc)
+
+    @staticmethod
+    def to_iso(value: datetime) -> str:
+        if value.tzinfo is None:
+            value = value.replace(
+                tzinfo=timezone.utc
             )
-        except ValueError:
-            logger.warning(
-                "Invalid timestamp from database: %r",
-                value,
-            )
+
+        return value.astimezone(
+            timezone.utc
+        ).isoformat()
+
+    @staticmethod
+    def parse_timestamp(
+        value: Any,
+    ) -> datetime | None:
+        if value is None:
             return None
 
-    else:
-        return None
+        if isinstance(value, datetime):
+            result = value
 
-    if result.tzinfo is None:
-        result = result.replace(
-            tzinfo=timezone.utc
+        elif isinstance(value, str):
+            try:
+                result = datetime.fromisoformat(
+                    value.replace(
+                        "Z",
+                        "+00:00",
+                    )
+                )
+            except ValueError:
+                logger.warning(
+                    "Invalid database timestamp: %r",
+                    value,
+                )
+                return None
+
+        else:
+            return None
+
+        if result.tzinfo is None:
+            result = result.replace(
+                tzinfo=timezone.utc
+            )
+
+        return result.astimezone(
+            timezone.utc
         )
 
-    return result.astimezone(
-        timezone.utc
-    )
+    # ============================================================
+    # GAME LOOKUP
+    # ============================================================
 
-# ============================================================
-# GAME LOOKUP
-# ============================================================
-
-async def get_game(
-    self,
-    game_id: str,
-) -> dict[str, Any]:
-
-    game = await self.db.get_game(
-        game_id
-    )
-
-    if not game:
-        raise ValueError(
-            "Game does not exist."
+    async def get_game(
+        self,
+        game_id: str,
+    ) -> dict[str, Any]:
+        game = await self.db.get_game(
+            game_id
         )
 
-    return game
+        if not game:
+            raise ValueError(
+                "Game does not exist."
+            )
 
-async def get_game_with_players(
-    self,
-    game_id: str,
-) -> tuple[
-    dict[str, Any],
-    list[dict[str, Any]],
-]:
+        return game
 
-    game = await self.get_game(
-        game_id
-    )
-
-    players = await self.db.get_players(
-        game_id
-    )
-
-    return game, players
-
-def engine_for_game(
-    self,
-    game: dict[str, Any],
-) -> GameEngine:
-
-    story = game.get(
-        "story"
-    )
-
-    if not isinstance(
-        story,
-        dict,
-    ):
-        raise ValueError(
-            "Game does not contain a valid story."
+    async def get_game_with_players(
+        self,
+        game_id: str,
+    ) -> tuple[
+        dict[str, Any],
+        list[dict[str, Any]],
+    ]:
+        game = await self.get_game(
+            game_id
         )
 
-    return GameEngine(
-        story
-    )
-
-# ============================================================
-# STORY GENERATION
-# ============================================================
-
-async def generate_unique_story(
-    self,
-    *,
-    player_count: int,
-    max_attempts: int = 5,
-) -> tuple[
-    dict[str, Any],
-    str,
-]:
-
-    if player_count < 1:
-        raise ValueError(
-            "player_count must be at least 1."
+        players = await self.db.get_players(
+            game_id
         )
 
-    recent = await self.db.get_recent_fingerprints(
-        limit=100
-    )
+        return game, players
 
-    previous = list(
-        recent
-    )
+    def engine_for_game(
+        self,
+        game: dict[str, Any],
+    ) -> GameEngine:
+        story = game.get(
+            "story"
+        )
 
-    for _ in range(
-        max_attempts
-    ):
+        if not isinstance(
+            story,
+            dict,
+        ):
+            raise ValueError(
+                "Game does not contain a valid story."
+            )
 
+        return GameEngine(
+            story
+        )
+
+    # ============================================================
+    # PLAYER STATUS
+    # ============================================================
+
+    @classmethod
+    def player_status(
+        cls,
+        player: dict[str, Any],
+    ) -> str:
+        status = player.get(
+            "status"
+        )
+
+        if status in {
+            cls.PLAYER_PENDING,
+            cls.PLAYER_ACTIVE,
+            cls.PLAYER_ELIMINATED,
+            cls.PLAYER_NPC,
+            cls.PLAYER_LEFT,
+        }:
+            return status
+
+        # Compatibility with older database rows.
+        if player.get(
+            "active",
+            False,
+        ):
+            return cls.PLAYER_ACTIVE
+
+        return cls.PLAYER_LEFT
+
+    @classmethod
+    def is_counted_player(
+        cls,
+        player: dict[str, Any],
+    ) -> bool:
+        return cls.player_status(
+            player
+        ) in {
+            cls.PLAYER_PENDING,
+            cls.PLAYER_ACTIVE,
+        }
+
+    @classmethod
+    def is_required_for_round(
+        cls,
+        player: dict[str, Any],
+        round_number: int,
+    ) -> bool:
+        status = cls.player_status(
+            player
+        )
+
+        if status not in {
+            cls.PLAYER_ACTIVE,
+            cls.PLAYER_NPC,
+        }:
+            return False
+
+        joined_round = int(
+            player.get(
+                "joined_round",
+                0,
+            )
+            or 0
+        )
+
+        return joined_round <= int(
+            round_number
+        )
+
+    @classmethod
+    def active_human_players(
+        cls,
+        players: list[dict[str, Any]],
+        round_number: int,
+    ) -> list[dict[str, Any]]:
+        return [
+            player
+            for player in players
+            if cls.player_status(player)
+            == cls.PLAYER_ACTIVE
+            and cls.is_required_for_round(
+                player,
+                round_number,
+            )
+        ]
+
+    # ============================================================
+    # STORY GENERATION
+    # ============================================================
+
+    async def generate_unique_story(
+        self,
+        *,
+        player_count: int,
+        max_attempts: int = 5,
+    ) -> tuple[
+        dict[str, Any],
+        str,
+    ]:
+        if player_count < 1:
+            raise ValueError(
+                "player_count must be at least 1."
+            )
+
+        recent = await self.db.get_recent_fingerprints(
+            limit=100
+        )
+
+        previous = list(
+            recent
+        )
+
+        for _ in range(
+            max_attempts
+        ):
+            story, fingerprint = (
+                await self.story_generator.generate(
+                    player_count=player_count,
+                    previous_fingerprints=previous,
+                )
+            )
+
+            engine = GameEngine(
+                story
+            )
+
+            self.validate_player_count(
+                player_count,
+                engine,
+            )
+
+            if fingerprint in previous:
+                continue
+
+            if await self.db.fingerprint_exists(
+                fingerprint
+            ):
+                previous.append(
+                    fingerprint
+                )
+                continue
+
+            return (
+                story,
+                fingerprint,
+            )
+
+        raise RuntimeError(
+            "Unable to generate a unique validated story."
+        )
+
+    # ============================================================
+    # GAME CREATION
+    # ============================================================
+
+    async def create_game(
+        self,
+        *,
+        chat_id: int,
+        creator_id: int,
+    ) -> dict[str, Any]:
+        existing = await self.db.get_active_game(
+            chat_id
+        )
+
+        if existing:
+            raise DatabaseConflict(
+                "This chat already has an active game."
+            )
+
+        # A lobby does not yet know the final player count.
+        #
+        # The generator is therefore asked for the configured
+        # minimum viable story. Later joins are still checked
+        # against the actual playable roles.
         story, fingerprint = (
-            await self.story_generator.generate(
-                player_count=player_count,
-                previous_fingerprints=previous,
+            await self.generate_unique_story(
+                player_count=1
             )
         )
 
-        # Defensive second validation at the engine boundary.
         engine = GameEngine(
             story
         )
 
-        self.validate_player_count(
-            player_count,
-            engine,
+        world_state = (
+            engine.initial_world_state()
         )
 
-        if fingerprint in previous:
-            continue
-
-        if await self.db.fingerprint_exists(
-            fingerprint
-        ):
-            previous.append(
-                fingerprint
+        join_deadline = (
+            self.now_utc()
+            + timedelta(
+                seconds=self.join_seconds
             )
-            continue
-
-        return (
-            story,
-            fingerprint,
         )
 
-    raise RuntimeError(
-        "Unable to generate a unique validated story."
-    )
-
-# ============================================================
-# CREATE GAME
-# ============================================================
-
-async def create_game(
-    self,
-    *,
-    chat_id: int,
-    creator_id: int,
-) -> dict[str, Any]:
-
-    existing = await self.db.get_active_game(
-        chat_id
-    )
-
-    if existing:
-        raise DatabaseConflict(
-            "This chat already has an active game."
+        game = await self.db.create_game(
+            chat_id=chat_id,
+            creator_id=creator_id,
+            story=story,
+            fingerprint=fingerprint,
+            join_deadline=self.to_iso(
+                join_deadline
+            ),
+            world_state=world_state,
+            story_player_count=1,
         )
 
-    # We cannot know the final player count yet.
-    #
-    # Generate a story using the minimum player count.
-    # The story validator/engine still ensures that the story
-    # contains enough playable roles for later joins.
-    story, fingerprint = (
-        await self.generate_unique_story(
-            player_count=1
-        )
-    )
-
-    engine = GameEngine(
-        story
-    )
-
-    world_state = (
-        engine.initial_world_state()
-    )
-
-    join_deadline = (
-        self.now_utc()
-        + timedelta(
-            seconds=self.join_seconds
-        )
-    )
-
-    game = await self.db.create_game(
-        chat_id=chat_id,
-        creator_id=creator_id,
-        story=story,
-        fingerprint=fingerprint,
-        join_deadline=self.to_iso(
-            join_deadline
-        ),
-        world_state=world_state,
-        story_player_count=1,
-    )
-
-    # Story history is deliberately persisted separately from
-    # the current game state.
-    try:
-        await self.db.save_story_history(
-            fingerprint,
-            story,
-        )
-    except DatabaseConflict:
-        # The database uniqueness constraint won a race.
-        # The game itself remains valid only if its fingerprint
-        # was accepted by the games transaction.
-        logger.warning(
-            "Story fingerprint already existed: %s",
-            fingerprint,
-        )
-
-    await self.db.append_event(
-        game_id=game["id"],
-        event_type="game_created",
-        round_number=0,
-        user_id=creator_id,
-        payload={
-            "chat_id": chat_id,
-            "story_fingerprint": fingerprint,
-        },
-    )
-
-    return game
-
-# ============================================================
-# PLAYER LIFECYCLE
-# ============================================================
-
-@classmethod
-def player_status(
-    cls,
-    player: dict[str, Any],
-) -> str:
-
-    status = player.get(
-        "status"
-    )
-
-    if status in {
-        cls.PLAYER_PENDING,
-        cls.PLAYER_ACTIVE,
-        cls.PLAYER_ELIMINATED,
-        cls.PLAYER_NPC,
-        cls.PLAYER_LEFT,
-    }:
-        return status
-
-    # Compatibility with an older schema.
-    if player.get(
-        "active",
-        False,
-    ):
-        return cls.PLAYER_ACTIVE
-
-    return cls.PLAYER_LEFT
-
-@classmethod
-def is_counted_player(
-    cls,
-    player: dict[str, Any],
-) -> bool:
-
-    return cls.player_status(
-        player
-    ) in {
-        cls.PLAYER_PENDING,
-        cls.PLAYER_ACTIVE,
-    }
-
-@classmethod
-def is_required_for_round(
-    cls,
-    player: dict[str, Any],
-    round_number: int,
-) -> bool:
-
-    status = cls.player_status(
-        player
-    )
-
-    if status != cls.PLAYER_ACTIVE:
-        return False
-
-    joined_round = int(
-        player.get(
-            "joined_round",
-            0,
-        )
-        or 0
-    )
-
-    return joined_round <= round_number
-
-async def join_game(
-    self,
-    *,
-    game_id: str,
-    user_id: int,
-    username: str,
-    display_name: str,
-) -> dict[str, Any]:
-
-    game = await self.get_game(
-        game_id
-    )
-
-    status = game.get(
-        "status"
-    )
-
-    if status not in {
-        self.STATUS_LOBBY,
-        self.STATUS_PLAYING,
-    }:
-        raise ValueError(
-            "This game is not accepting new players."
-        )
-
-    existing = await self.db.get_player(
-        game_id,
-        user_id,
-    )
-
-    if existing:
-
-        existing_status = self.player_status(
-            existing
-        )
-
-        if existing_status == self.PLAYER_LEFT:
-            raise ValueError(
-                "A player who left cannot rejoin."
+        try:
+            await self.db.save_story_history(
+                fingerprint,
+                story,
+                player_count=1,
+            )
+        except DatabaseConflict:
+            logger.warning(
+                "Story fingerprint already existed: %s",
+                fingerprint,
             )
 
-        return existing
-
-    players = await self.db.get_players(
-        game_id
-    )
-
-    counted = sum(
-        1
-        for player in players
-        if self.is_counted_player(
-            player
-        )
-    )
-
-    if counted >= self.MAX_PLAYERS:
-        raise ValueError(
-            "The game has reached its player limit."
+        await self.db.append_event(
+            game_id=game["id"],
+            event_type="game_created",
+            round_number=0,
+            user_id=creator_id,
+            payload={
+                "chat_id": chat_id,
+                "story_fingerprint": fingerprint,
+            },
         )
 
-    engine = self.engine_for_game(
-        game
-    )
+        return game
 
-    playable_count = len(
-        engine.playable_roles()
-    )
+    # ============================================================
+    # JOIN / LEAVE
+    # ============================================================
 
-    if counted >= playable_count:
-        raise ValueError(
-            "The story has no unused playable role "
-            "for another player."
-        )
-
-    current_round = int(
-        game.get(
-            "current_round",
-            0,
-        )
-        or 0
-    )
-
-    if status == self.STATUS_LOBBY:
-        joined_round = 0
-    else:
-        # A player joining during gameplay becomes eligible
-        # only from the following round.
-        joined_round = (
-            current_round + 1
-        )
-
-    player = await self.db.add_player(
-        game_id=game_id,
-        user_id=user_id,
-        username=username or "",
-        display_name=display_name or "Player",
-        joined_round=joined_round,
-        status=self.PLAYER_PENDING,
-    )
-
-    await self.db.append_event(
-        game_id=game_id,
-        event_type="player_joined",
-        round_number=current_round,
-        user_id=user_id,
-        payload={
-            "joined_round": joined_round,
-            "display_name": display_name,
-        },
-    )
-
-    return player
-
-# ============================================================
-# PLAYER STATUS
-# ============================================================
-
-async def leave_game(
-    self,
-    *,
-    game_id: str,
-    user_id: int,
-) -> None:
-
-    player = await self.db.get_player(
-        game_id,
-        user_id,
-    )
-
-    if not player:
-        return
-
-    status = self.player_status(
-        player
-    )
-
-    if status in {
-        self.PLAYER_LEFT,
-        self.PLAYER_ELIMINATED,
-    }:
-        return
-
-    await self.db.update_player(
-        game_id,
-        user_id,
-        {
-            "status": self.PLAYER_LEFT,
-        },
-    )
-
-    await self.db.append_event(
-        game_id=game_id,
-        event_type="player_left",
-        user_id=user_id,
-        payload={},
-    )
-
-async def eliminate_player(
-    self,
-    *,
-    game_id: str,
-    user_id: int,
-) -> None:
-
-    await self.db.eliminate_player(
-        game_id,
-        user_id,
-    )
-
-    await self.db.append_event(
-        game_id=game_id,
-        event_type="player_eliminated",
-        user_id=user_id,
-        payload={},
-    )
-
-async def convert_player_to_npc(
-    self,
-    *,
-    game_id: str,
-    user_id: int,
-) -> None:
-
-    await self.db.convert_player_to_npc(
-        game_id,
-        user_id,
-    )
-
-    await self.db.append_event(
-        game_id=game_id,
-        event_type="player_converted_to_npc",
-        user_id=user_id,
-        payload={},
-    )
-
-# ============================================================
-# PLAYER COUNT
-# ============================================================
-
-@staticmethod
-def validate_player_count(
-    player_count: int,
-    engine: GameEngine,
-) -> None:
-
-    if player_count < 1:
-        raise ValueError(
-            "At least one player is required."
-        )
-
-    playable_count = len(
-        engine.playable_roles()
-    )
-
-    if player_count > playable_count:
-        raise ValueError(
-            f"Story contains only {playable_count} "
-            f"playable roles for {player_count} players."
-        )
-
-# ============================================================
-# ROLE ASSIGNMENT
-# ============================================================
-
-async def assign_roles(
-    self,
-    game_id: str,
-) -> dict[str, str]:
-
-    game, players = (
-        await self.get_game_with_players(
+    async def join_game(
+        self,
+        *,
+        game_id: str,
+        user_id: int,
+        username: str,
+        display_name: str,
+    ) -> dict[str, Any]:
+        game = await self.get_game(
             game_id
         )
-    )
 
-    engine = self.engine_for_game(
-        game
-    )
-
-    eligible = [
-        player
-        for player in players
-        if self.player_status(
-            player
-        )
-        in {
-            self.PLAYER_PENDING,
-            self.PLAYER_ACTIVE,
-        }
-    ]
-
-    self.validate_player_count(
-        len(eligible),
-        engine,
-    )
-
-    # If every eligible player already has a role, never
-    # reassign. This protects against accidental role reuse.
-    existing_roles = [
-        player.get(
-            "role_id"
-        )
-        for player in eligible
-        if player.get(
-            "role_id"
-        )
-    ]
-
-    if len(existing_roles) != len(
-        set(existing_roles)
-    ):
-        raise DatabaseConflict(
-            "Persisted player state already contains "
-            "duplicate role assignments."
+        status = game.get(
+            "status"
         )
 
-    missing = [
-        player
-        for player in eligible
-        if not player.get(
-            "role_id"
-        )
-    ]
-
-    if not missing:
-        return {
-            str(
-                player["user_id"]
-            ): player["role_id"]
-            for player in eligible
-        }
-
-    # Existing roles are reserved permanently.
-    reserved = set(
-        existing_roles
-    )
-
-    available_roles = [
-        role
-        for role in engine.playable_roles()
-        if role["id"] not in reserved
-    ]
-
-    if len(available_roles) < len(missing):
-        raise ValueError(
-            "There are not enough unused playable roles."
-        )
-
-    # Stable deterministic assignment.
-    missing_ids = sorted(
-        (
-            int(
-                player["user_id"]
+        if status not in {
+            self.STATUS_LOBBY,
+            self.STATUS_PLAYING,
+        }:
+            raise ValueError(
+                "This game is not accepting new players."
             )
-            for player in missing
-        )
-    )
 
-    available_roles.sort(
-        key=lambda role: role["id"]
-    )
-
-    assignments: dict[str, str] = {}
-
-    for index, user_id in enumerate(
-        missing_ids
-    ):
-        assignments[
-            str(user_id)
-        ] = available_roles[
-            index
-        ]["id"]
-
-    # Persist each role. The database uniqueness constraints
-    # are the final protection against duplicate membership/
-    # role state.
-    for user_id_string, role_id in assignments.items():
-
-        user_id = int(
-            user_id_string
+        existing = await self.db.get_player(
+            game_id,
+            user_id,
         )
 
+        if existing:
+            existing_status = self.player_status(
+                existing
+            )
+
+            if existing_status == self.PLAYER_LEFT:
+                raise ValueError(
+                    "A player who left cannot rejoin."
+                )
+
+            return existing
+
+        players = await self.db.get_players(
+            game_id
+        )
+
+        counted = sum(
+            1
+            for player in players
+            if self.is_counted_player(
+                player
+            )
+        )
+
+        if counted >= self.MAX_PLAYERS:
+            raise ValueError(
+                "The game has reached its player limit."
+            )
+
+        engine = self.engine_for_game(
+            game
+        )
+
+        assigned_role_ids = {
+            str(player["role_id"])
+            for player in players
+            if player.get("role_id")
+            and self.player_status(player)
+            not in {
+                self.PLAYER_LEFT,
+            }
+        }
+
+        available_roles = [
+            role
+            for role in engine.playable_roles()
+            if role["id"] not in assigned_role_ids
+        ]
+
+        if not available_roles:
+            raise ValueError(
+                "The story has no unused playable role "
+                "for another player."
+            )
+
+        current_round = int(
+            game.get(
+                "current_round",
+                0,
+            )
+            or 0
+        )
+
+        if status == self.STATUS_LOBBY:
+            joined_round = 0
+        else:
+            joined_round = current_round + 1
+
+        player = await self.db.add_player(
+            game_id=game_id,
+            user_id=user_id,
+            username=username or "",
+            display_name=display_name or "Player",
+            joined_round=joined_round,
+            status=self.PLAYER_PENDING,
+        )
+
+        await self.db.append_event(
+            game_id=game_id,
+            event_type="player_joined",
+            round_number=current_round,
+            user_id=user_id,
+            payload={
+                "joined_round": joined_round,
+                "display_name": display_name or "Player",
+            },
+        )
+
+        return player
+
+    async def leave_game(
+        self,
+        *,
+        game_id: str,
+        user_id: int,
+    ) -> None:
         player = await self.db.get_player(
             game_id,
             user_id,
         )
 
         if not player:
-            raise DatabaseConflict(
-                "Player disappeared while assigning roles."
-            )
+            return
 
-        existing_role = player.get(
-            "role_id"
+        status = self.player_status(
+            player
         )
 
-        if existing_role:
+        if status in {
+            self.PLAYER_LEFT,
+            self.PLAYER_ELIMINATED,
+        }:
+            return
 
-            if existing_role != role_id:
-                raise DatabaseConflict(
-                    "A role assignment changed concurrently."
-                )
-
-            continue
-
-        await self.db.assign_role(
+        await self.db.update_player(
             game_id,
             user_id,
-            role_id,
+            {
+                "status": self.PLAYER_LEFT,
+            },
         )
 
         await self.db.append_event(
             game_id=game_id,
-            event_type="role_assigned",
+            event_type="player_left",
             user_id=user_id,
-            payload={
-                "role_id": role_id,
-            },
+            payload={},
         )
 
-    # Return the complete persisted assignment.
-    refreshed = await self.db.get_players(
-        game_id
-    )
-
-    return {
-        str(
-            player["user_id"]
-        ): player["role_id"]
-        for player in refreshed
-        if player.get(
-            "role_id"
-        )
-    }
-
-# ============================================================
-# START GAME
-# ============================================================
-
-async def start_game(
-    self,
-    game_id: str,
-) -> dict[str, Any]:
-
-    game, players = (
-        await self.get_game_with_players(
-            game_id
-        )
-    )
-
-    if game.get(
-        "status"
-    ) != self.STATUS_LOBBY:
-        raise ValueError(
-            "Only a lobby can be started."
+    async def eliminate_player(
+        self,
+        *,
+        game_id: str,
+        user_id: int,
+    ) -> None:
+        await self.db.eliminate_player(
+            game_id,
+            user_id,
         )
 
-    engine = self.engine_for_game(
-        game
-    )
-
-    eligible = [
-        player
-        for player in players
-        if self.player_status(
-            player
+        await self.db.append_event(
+            game_id=game_id,
+            event_type="player_eliminated",
+            user_id=user_id,
+            payload={},
         )
-        in {
-            self.PLAYER_PENDING,
-            self.PLAYER_ACTIVE,
-        }
-    ]
 
-    self.validate_player_count(
-        len(eligible),
-        engine,
-    )
+    async def convert_player_to_npc(
+        self,
+        *,
+        game_id: str,
+        user_id: int,
+    ) -> None:
+        await self.db.convert_player_to_npc(
+            game_id,
+            user_id,
+        )
 
-    assignments = await self.assign_roles(
-        game_id
-    )
+        await self.db.append_event(
+            game_id=game_id,
+            event_type="player_converted_to_npc",
+            user_id=user_id,
+            payload={},
+        )
 
-    first_scene_id = (
-        engine.first_scene_id()
-    )
+    # ============================================================
+    # PLAYER COUNT / ROLE ASSIGNMENT
+    # ============================================================
 
-    world_state = (
-        engine.initial_world_state()
-    )
-
-    world_state = engine.enter_scene(
-        world_state,
-        first_scene_id,
-    )
-
-    scene = engine.get_scene(
-        first_scene_id
-    )
-
-    deadline = (
-        self.now_utc()
-        + timedelta(
-            seconds=engine.timer_seconds(
-                scene
+    @staticmethod
+    def validate_player_count(
+        player_count: int,
+        engine: GameEngine,
+    ) -> None:
+        if player_count < 1:
+            raise ValueError(
+                "At least one player is required."
             )
-        )
-    )
 
-    # The PostgreSQL RPC is authoritative for the transition.
-    # It must lock the game row and reject a concurrent start.
-    started = await self.db.start_game_atomic(
-        game_id,
-        scene_id=first_scene_id,
-        round_number=1,
-        decision_deadline=self.to_iso(
-            deadline
-        ),
-        world_state=world_state,
-    )
-
-    await self.db.append_event(
-        game_id=game_id,
-        event_type="game_started",
-        round_number=1,
-        payload={
-            "scene_id": first_scene_id,
-            "decision_deadline": self.to_iso(
-                deadline
-            ),
-            "assignments": assignments,
-        },
-    )
-
-    return {
-        "game": started,
-        "scene": scene,
-        "assignments": assignments,
-        "decision_deadline": self.to_iso(
-            deadline
-        ),
-    }
-
-# ============================================================
-# DECISION SUBMISSION
-# ============================================================
-
-async def submit_decision(
-    self,
-    *,
-    game_id: str,
-    user_id: int,
-    choice_id: str,
-) -> dict[str, Any]:
-
-    game = await self.get_game(
-        game_id
-    )
-
-    if game.get(
-        "status"
-    ) != self.STATUS_PLAYING:
-        raise ValueError(
-            "This game is not accepting decisions."
+        playable_count = len(
+            engine.playable_roles()
         )
 
-    round_number = int(
-        game.get(
-            "current_round",
-            0,
-        )
-        or 0
-    )
+        if player_count > playable_count:
+            raise ValueError(
+                f"Story has only {playable_count} playable roles "
+                f"but requires {player_count}."
+            )
 
-    scene_id = game.get(
-        "current_scene_id"
-    )
-
-    if round_number < 1 or not scene_id:
-        raise ValueError(
-            "The current round is not valid."
-        )
-
-    deadline = self.parse_timestamp(
-        game.get(
-            "decision_deadline"
-        )
-    )
-
-    if (
-        deadline is not None
-        and self.now_utc() >= deadline
-    ):
-        raise ValueError(
-            "The decision deadline has passed."
-        )
-
-    player = await self.db.get_player(
-        game_id,
-        user_id,
-    )
-
-    if not player:
-        raise ValueError(
-            "You are not a member of this game."
-        )
-
-    if self.player_status(
-        player
-    ) != self.PLAYER_ACTIVE:
-        raise ValueError(
-            "You are not an active player."
-        )
-
-    if not self.is_required_for_round(
-        player,
-        round_number,
-    ):
-        raise ValueError(
-            "You are not participating in this round."
-        )
-
-    role_id = player.get(
-        "role_id"
-    )
-
-    if not role_id:
-        raise ValueError(
-            "Your role has not been assigned."
-        )
-
-    engine = self.engine_for_game(
-        game
-    )
-
-    scene = engine.get_scene(
-        scene_id
-    )
-
-    # Validate before persistence.
-    engine.validate_choice_for_role(
-        scene,
-        role_id,
-        choice_id,
-        game.get(
-            "world_state"
-        )
-        or {},
-    )
-
-    created = await self.db.save_decision(
-        game_id=game_id,
-        round_number=round_number,
-        scene_id=scene_id,
-        user_id=user_id,
-        choice_id=choice_id,
-    )
-
-    if not created:
-        raise DatabaseConflict(
-            "A decision has already been submitted "
-            "for this player and round."
-        )
-
-    await self.db.append_event(
-        game_id=game_id,
-        event_type="decision_submitted",
-        round_number=round_number,
-        user_id=user_id,
-        payload={
-            "scene_id": scene_id,
-            "choice_id": choice_id,
-        },
-    )
-
-    decisions = await self.db.get_round_decisions(
-        game_id,
-        round_number,
-    )
-
-    required = [
-        player
-        for player in await self.db.get_players(
-            game_id
-        )
-        if self.is_required_for_round(
-            player,
-            round_number,
-        )
-    ]
-
-    decided_users = {
-        int(
-            decision["user_id"]
-        )
-        for decision in decisions
-    }
-
-    all_decided = all(
-        int(
-            player["user_id"]
-        )
-        in decided_users
-        for player in required
-    )
-
-    return {
-        "accepted": True,
-        "all_decided": all_decided,
-        "game_id": game_id,
-        "round_number": round_number,
-        "scene_id": scene_id,
-        "choice_id": choice_id,
-    }
-
-# ============================================================
-# ROUND RESOLUTION
-# ============================================================
-
-async def resolve_round(
-    self,
-    game_id: str,
-) -> dict[str, Any] | None:
-
-    game = await self.get_game(
-        game_id
-    )
-
-    status = game.get(
-        "status"
-    )
-
-    if status not in {
-        self.STATUS_PLAYING,
-        self.STATUS_RESOLVING,
-    }:
-        return None
-
-    round_number = int(
-        game.get(
-            "current_round",
-            0,
-        )
-        or 0
-    )
-
-    scene_id = game.get(
-        "current_scene_id"
-    )
-
-    if round_number < 1 or not scene_id:
-        return None
-
-    # One unique resolution key identifies this exact
-    # game/round resolution attempt.
-    resolution_key = (
-        f"{game_id}:round:{round_number}"
-    )
-
-    claimed = await self.db.claim_round_resolution(
-        game_id,
-        round_number,
-        resolution_key,
-    )
-
-    if not claimed:
-        return None
-
-    try:
-
-        # Re-read AFTER claiming.
-        game = await self.get_game(
+    async def assign_roles(
+        self,
+        *,
+        game_id: str,
+    ) -> dict[int, str]:
+        game, players = await self.get_game_with_players(
             game_id
         )
 
@@ -1166,68 +675,503 @@ async def resolve_round(
             game
         )
 
+        eligible_players = [
+            player
+            for player in players
+            if self.player_status(player)
+            in {
+                self.PLAYER_PENDING,
+                self.PLAYER_ACTIVE,
+            }
+        ]
+
+        if not eligible_players:
+            raise ValueError(
+                "There are no players to assign roles to."
+            )
+
+        self.validate_player_count(
+            len(eligible_players),
+            engine,
+        )
+
+        # Never reuse an already assigned role.
+        existing_assignments: dict[str, int] = {}
+
+        for player in players:
+            role_id = player.get(
+                "role_id"
+            )
+
+            if not role_id:
+                continue
+
+            if self.player_status(player) in {
+                self.PLAYER_LEFT,
+            }:
+                continue
+
+            if role_id in existing_assignments:
+                raise DatabaseConflict(
+                    f"Role {role_id} is already assigned to "
+                    "more than one player."
+                )
+
+            existing_assignments[role_id] = int(
+                player["user_id"]
+            )
+
+        available_roles = [
+            role["id"]
+            for role in engine.playable_roles()
+            if role["id"]
+            not in existing_assignments
+        ]
+
+        unassigned = [
+            player
+            for player in eligible_players
+            if not player.get("role_id")
+        ]
+
+        if len(available_roles) < len(unassigned):
+            raise ValueError(
+                "Not enough unused playable roles remain."
+            )
+
+        # Deterministic assignment.
+        unassigned.sort(
+            key=lambda player: str(
+                player["user_id"]
+            )
+        )
+
+        available_roles.sort()
+
+        assignments: dict[int, str] = {}
+
+        for player, role_id in zip(
+            unassigned,
+            available_roles,
+        ):
+            user_id = int(
+                player["user_id"]
+            )
+
+            await self.db.assign_role(
+                game_id,
+                user_id,
+                role_id,
+            )
+
+            assignments[user_id] = role_id
+
+        return assignments
+
+    # ============================================================
+    # START GAME
+    # ============================================================
+
+    async def start_game(
+        self,
+        *,
+        game_id: str,
+    ) -> dict[str, Any]:
+        game, players = await self.get_game_with_players(
+            game_id
+        )
+
+        if game.get("status") not in {
+            self.STATUS_LOBBY,
+            self.STATUS_STARTING,
+        }:
+            raise ValueError(
+                "Game cannot be started from its current state."
+            )
+
+        active_players = [
+            player
+            for player in players
+            if self.is_counted_player(
+                player
+            )
+        ]
+
+        if not active_players:
+            raise ValueError(
+                "At least one player is required."
+            )
+
+        engine = self.engine_for_game(
+            game
+        )
+
+        self.validate_player_count(
+            len(active_players),
+            engine,
+        )
+
+        await self.assign_roles(
+            game_id=game_id
+        )
+
+        # Reload after role assignment so the database is the
+        # source of truth.
         players = await self.db.get_players(
             game_id
         )
 
-        decisions = await self.db.get_round_decisions(
-            game_id,
-            round_number,
+        scene_id = engine.first_scene_id()
+
+        scene = engine.get_scene(
+            scene_id
         )
+
+        world_state = engine.enter_scene(
+            game.get(
+                "world_state"
+            )
+            or engine.initial_world_state(),
+            scene_id,
+        )
+
+        timer_seconds = min(
+            self.maximum_decision_seconds,
+            max(
+                self.minimum_decision_seconds,
+                engine.timer_seconds(scene),
+            ),
+        )
+
+        deadline = (
+            self.now_utc()
+            + timedelta(
+                seconds=timer_seconds
+            )
+        )
+
+        started = await self.db.start_game_atomic(
+            game_id,
+            scene_id=scene_id,
+            round_number=1,
+            decision_deadline=self.to_iso(
+                deadline
+            ),
+            world_state=world_state,
+        )
+
+        await self.db.append_event(
+            game_id=game_id,
+            event_type="game_started",
+            round_number=1,
+            payload={
+                "scene_id": scene_id,
+                "decision_deadline": self.to_iso(
+                    deadline
+                ),
+            },
+        )
+
+        return started
+
+    # ============================================================
+    # DECISIONS
+    # ============================================================
+
+    async def submit_decision(
+        self,
+        *,
+        game_id: str,
+        user_id: int,
+        choice_id: str,
+    ) -> dict[str, Any]:
+        game = await self.get_game(
+            game_id
+        )
+
+        if game.get("status") != self.STATUS_PLAYING:
+            raise ValueError(
+                "The game is not currently accepting decisions."
+            )
+
+        round_number = int(
+            game.get(
+                "current_round",
+                0,
+            )
+            or 0
+        )
+
+        scene_id = game.get(
+            "current_scene_id"
+        )
+
+        if not scene_id:
+            raise ValueError(
+                "Game has no current scene."
+            )
+
+        player = await self.db.get_player(
+            game_id,
+            user_id,
+        )
+
+        if not player:
+            raise ValueError(
+                "You are not a player in this game."
+            )
+
+        if self.player_status(player) != self.PLAYER_ACTIVE:
+            raise ValueError(
+                "You are not currently an active player."
+            )
+
+        joined_round = int(
+            player.get(
+                "joined_round",
+                0,
+            )
+            or 0
+        )
+
+        if joined_round > round_number:
+            raise ValueError(
+                "You joined after this round began."
+            )
+
+        deadline = self.parse_timestamp(
+            game.get(
+                "decision_deadline"
+            )
+        )
+
+        if deadline is not None:
+            if self.now_utc() >= deadline:
+                # Timeout handling and this request can race.
+                # The resolver below is the authoritative arbiter.
+                await self.resolve_round_if_due(
+                    game_id=game_id,
+                    expected_round=round_number,
+                )
+
+                raise ValueError(
+                    "The decision deadline has expired."
+                )
+
+        engine = self.engine_for_game(
+            game
+        )
+
+        scene = engine.get_scene(
+            scene_id
+        )
+
+        role_id = player.get(
+            "role_id"
+        )
+
+        if not role_id:
+            raise ValueError(
+                "Player has no assigned role."
+            )
+
+        world_state = (
+            game.get(
+                "world_state"
+            )
+            or await self.db.get_world_state(
+                game_id
+            )
+            or engine.initial_world_state()
+        )
+
+        engine.validate_choice_for_role(
+            scene,
+            str(role_id),
+            choice_id,
+            world_state,
+        )
+
+        created = await self.db.save_decision(
+            game_id=game_id,
+            round_number=round_number,
+            scene_id=scene_id,
+            user_id=user_id,
+            choice_id=choice_id,
+        )
+
+        if not created:
+            existing = await self.db.get_decision(
+                game_id,
+                round_number,
+                user_id,
+            )
+
+            return {
+                "accepted": False,
+                "duplicate": True,
+                "decision": existing,
+            }
+
+        await self.db.reset_missed_decisions(
+            game_id,
+            user_id,
+        )
+
+        await self.db.append_event(
+            game_id=game_id,
+            event_type="decision_submitted",
+            round_number=round_number,
+            user_id=user_id,
+            payload={
+                "scene_id": scene_id,
+                "choice_id": choice_id,
+            },
+        )
+
+        result = await self.resolve_if_ready(
+            game_id=game_id
+        )
+
+        return {
+            "accepted": True,
+            "duplicate": False,
+            "resolved": bool(result),
+            "resolution": result,
+        }
+
+    # ============================================================
+    # ROUND RESOLUTION
+    # ============================================================
+
+    def resolution_key(
+        self,
+        game_id: str,
+        round_number: int,
+    ) -> str:
+        raw = (
+            f"{game_id}:"
+            f"{round_number}"
+        )
+
+        return hashlib.sha256(
+            raw.encode("utf-8")
+        ).hexdigest()
+
+    async def _resolve_round(
+        self,
+        *,
+        game: dict[str, Any],
+        players: list[dict[str, Any]],
+        decisions: list[dict[str, Any]],
+        round_number: int,
+        force_timeout: bool,
+    ) -> dict[str, Any]:
+        engine = self.engine_for_game(
+            game
+        )
+
+        scene_id = game.get(
+            "current_scene_id"
+        )
+
+        if not scene_id:
+            raise ValueError(
+                "Game has no current scene."
+            )
+
+        world_state = (
+            game.get(
+                "world_state"
+            )
+            or await self.db.get_world_state(
+                game["id"]
+            )
+            or engine.initial_world_state()
+        )
+
+        eligible_players = [
+            player
+            for player in players
+            if self.is_required_for_round(
+                player,
+                round_number,
+            )
+        ]
+
+        if not force_timeout:
+            human_players = [
+                player
+                for player in eligible_players
+                if self.player_status(player)
+                == self.PLAYER_ACTIVE
+            ]
+
+            decision_users = {
+                int(
+                    decision["user_id"]
+                )
+                for decision in decisions
+            }
+
+            if any(
+                int(player["user_id"])
+                not in decision_users
+                for player in human_players
+            ):
+                raise RuntimeError(
+                    "Round is not ready for resolution."
+                )
 
         result = engine.resolve_round(
             scene_id=scene_id,
             round_number=round_number,
-            world_state=game.get(
-                "world_state"
-            )
-            or {},
-            players=players,
+            world_state=world_state,
+            players=eligible_players,
             decisions=decisions,
         )
 
-        # Persist missed-decision state before the atomic round
-        # completion. The database increment itself is atomic.
+        # Persist missed-decision state.
         #
-        # The final SQL migration will tighten this into the
-        # complete round transaction.
+        # This is intentionally done before the atomic round
+        # completion so that the database remains authoritative.
         for missed in result.get(
             "missed_results",
             [],
         ):
-
             user_id = int(
                 missed["user_id"]
             )
 
-            new_count = (
-                await self.db.increment_missed_decisions(
-                    game_id,
-                    user_id,
-                )
+            new_count = int(
+                missed["missed_decisions"]
             )
 
-            if new_count >= 3:
+            await self.db.increment_missed_decisions(
+                game["id"],
+                user_id,
+            )
 
-                await self.db.eliminate_player(
-                    game_id,
+            if new_count >= self.MAX_MISSED_DECISIONS:
+                await self.db.convert_player_to_npc(
+                    game["id"],
                     user_id,
                 )
 
                 await self.db.append_event(
-                    game_id=game_id,
-                    event_type="player_eliminated_for_missed_decisions",
+                    game_id=game["id"],
+                    event_type="player_converted_to_npc",
                     round_number=round_number,
                     user_id=user_id,
                     payload={
+                        "reason": "missed_decisions",
                         "missed_decisions": new_count,
                     },
                 )
 
             else:
-
                 await self.db.append_event(
-                    game_id=game_id,
+                    game_id=game["id"],
                     event_type="decision_missed",
                     round_number=round_number,
                     user_id=user_id,
@@ -1235,17 +1179,6 @@ async def resolve_round(
                         "missed_decisions": new_count,
                     },
                 )
-
-        for decision in decisions:
-
-            user_id = int(
-                decision["user_id"]
-            )
-
-            await self.db.reset_missed_decisions(
-                game_id,
-                user_id,
-            )
 
         ending = result.get(
             "ending"
@@ -1256,296 +1189,273 @@ async def resolve_round(
         )
 
         if ending:
-
-            game_status = (
-                self.STATUS_COMPLETED
-            )
-
-            next_round_number = (
-                round_number
-            )
-
+            next_round_number = None
             next_deadline = None
+            game_status = self.STATUS_COMPLETED
 
         elif next_scene_id:
+            next_round_number = (
+                round_number + 1
+            )
 
             next_scene = engine.get_scene(
                 next_scene_id
             )
 
-            next_round_number = (
-                round_number + 1
+            timer_seconds = min(
+                self.maximum_decision_seconds,
+                max(
+                    self.minimum_decision_seconds,
+                    engine.timer_seconds(
+                        next_scene
+                    ),
+                ),
             )
 
-            next_deadline_dt = (
+            next_deadline = (
                 self.now_utc()
                 + timedelta(
-                    seconds=engine.timer_seconds(
-                        next_scene
-                    )
+                    seconds=timer_seconds
                 )
             )
 
-            next_deadline = self.to_iso(
-                next_deadline_dt
+            next_deadline_iso = self.to_iso(
+                next_deadline
             )
 
-            game_status = (
-                self.STATUS_PLAYING
+            result["next_deadline"] = (
+                next_deadline_iso
             )
+
+            game_status = self.STATUS_PLAYING
 
         else:
-
-            game_status = (
-                self.STATUS_COMPLETED
+            raise ValueError(
+                "Round produced neither an ending nor "
+                "a next scene."
             )
 
-            next_round_number = (
-                round_number
-            )
+        resolution_key = self.resolution_key(
+            game["id"],
+            round_number,
+        )
 
-            next_deadline = None
+        claimed = await self.db.claim_round_resolution(
+            game["id"],
+            round_number,
+            resolution_key,
+        )
 
-        completed = (
-            await self.db.complete_round_atomic(
-                game_id=game_id,
-                round_number=round_number,
-                next_scene_id=next_scene_id,
-                next_round_number=next_round_number,
-                decision_deadline=next_deadline,
-                world_state=result[
-                    "world_state"
-                ],
-                game_status=game_status,
-                resolution_key=resolution_key,
-            )
+        if not claimed:
+            # Another worker/callback owns the resolution.
+            # This is expected during timeout/click races.
+            return {
+                "resolved": False,
+                "already_claimed": True,
+                "round_number": round_number,
+            }
+
+        if ending:
+            deadline_iso = None
+        else:
+            deadline_iso = result["next_deadline"]
+
+        completed = await self.db.complete_round_atomic(
+            game_id=game["id"],
+            round_number=round_number,
+            next_scene_id=next_scene_id,
+            next_round_number=next_round_number,
+            decision_deadline=deadline_iso,
+            world_state=result["world_state"],
+            game_status=game_status,
+            resolution_key=resolution_key,
         )
 
         await self.db.append_event(
-            game_id=game_id,
-            event_type="round_resolved",
+            game_id=game["id"],
+            event_type=(
+                "game_completed"
+                if ending
+                else "round_resolved"
+            ),
             round_number=round_number,
             payload={
                 "scene_id": scene_id,
                 "next_scene_id": next_scene_id,
-                "next_round_number": next_round_number,
                 "ending": ending,
+                "forced_timeout": force_timeout,
             },
         )
 
         return {
-            "game_id": game_id,
+            "resolved": True,
+            "already_claimed": False,
             "round_number": round_number,
-            "scene_id": scene_id,
             "result": result,
-            "completed": completed,
+            "game": completed,
         }
 
-    except Exception:
+    async def resolve_if_ready(
+        self,
+        *,
+        game_id: str,
+    ) -> dict[str, Any] | None:
+        game, players = await self.get_game_with_players(
+            game_id
+        )
 
-        logger.exception(
-            "Round resolution failed for %s round %s.",
+        if game.get("status") != self.STATUS_PLAYING:
+            return None
+
+        round_number = int(
+            game.get(
+                "current_round",
+                0,
+            )
+            or 0
+        )
+
+        decisions = await self.db.get_round_decisions(
             game_id,
             round_number,
         )
 
-        raise
+        required_players = [
+            player
+            for player in players
+            if self.is_required_for_round(
+                player,
+                round_number,
+            )
+        ]
 
-# ============================================================
-# RESOLVE WHEN EVERY PLAYER HAS DECIDED
-# ============================================================
+        required_user_ids = {
+            int(player["user_id"])
+            for player in required_players
+            if self.player_status(player)
+            == self.PLAYER_ACTIVE
+        }
 
-async def resolve_if_ready(
-    self,
-    game_id: str,
-) -> dict[str, Any] | None:
+        decision_user_ids = {
+            int(decision["user_id"])
+            for decision in decisions
+        }
 
-    game = await self.get_game(
-        game_id
-    )
+        if not required_user_ids.issubset(
+            decision_user_ids
+        ):
+            return None
 
-    if game.get(
-        "status"
-    ) != self.STATUS_PLAYING:
-        return None
-
-    round_number = int(
-        game.get(
-            "current_round",
-            0,
+        return await self._resolve_round(
+            game=game,
+            players=players,
+            decisions=decisions,
+            round_number=round_number,
+            force_timeout=False,
         )
-        or 0
-    )
 
-    players = await self.db.get_players(
-        game_id
-    )
+    async def resolve_round_if_due(
+        self,
+        *,
+        game_id: str,
+        expected_round: int | None = None,
+    ) -> dict[str, Any] | None:
+        game, players = await self.get_game_with_players(
+            game_id
+        )
 
-    required = [
-        player
-        for player in players
-        if self.is_required_for_round(
-            player,
+        if game.get("status") != self.STATUS_PLAYING:
+            return None
+
+        round_number = int(
+            game.get(
+                "current_round",
+                0,
+            )
+            or 0
+        )
+
+        if (
+            expected_round is not None
+            and round_number != expected_round
+        ):
+            return None
+
+        deadline = self.parse_timestamp(
+            game.get(
+                "decision_deadline"
+            )
+        )
+
+        if deadline is None:
+            raise DatabaseError(
+                "Playing game has no decision deadline."
+            )
+
+        if self.now_utc() < deadline:
+            return None
+
+        decisions = await self.db.get_round_decisions(
+            game_id,
             round_number,
         )
-    ]
 
-    decisions = await self.db.get_round_decisions(
-        game_id,
-        round_number,
-    )
-
-    decided = {
-        int(
-            decision["user_id"]
+        return await self._resolve_round(
+            game=game,
+            players=players,
+            decisions=decisions,
+            round_number=round_number,
+            force_timeout=True,
         )
-        for decision in decisions
-    }
 
-    required_ids = {
-        int(
-            player["user_id"]
+    # Backwards-compatible public method.
+    async def resolve_round(
+        self,
+        *,
+        game_id: str,
+    ) -> dict[str, Any] | None:
+        game, players = await self.get_game_with_players(
+            game_id
         )
-        for player in required
-    }
 
-    if not required_ids.issubset(
-        decided
-    ):
-        return None
+        if game.get("status") != self.STATUS_PLAYING:
+            return None
 
-    return await self.resolve_round(
-        game_id
-    )
-
-# ============================================================
-# EXPIRED ROUND
-# ============================================================
-
-async def resolve_if_expired(
-    self,
-    game_id: str,
-) -> dict[str, Any] | None:
-
-    game = await self.get_game(
-        game_id
-    )
-
-    if game.get(
-        "status"
-    ) != self.STATUS_PLAYING:
-        return None
-
-    deadline = self.parse_timestamp(
-        game.get(
-            "decision_deadline"
+        round_number = int(
+            game.get(
+                "current_round",
+                0,
+            )
+            or 0
         )
-    )
 
-    if deadline is None:
-        logger.error(
-            "Playing game %s has no decision deadline.",
+        decisions = await self.db.get_round_decisions(
             game_id,
-        )
-        return None
-
-    if self.now_utc() < deadline:
-        return None
-
-    return await self.resolve_round(
-        game_id
-    )
-
-# ============================================================
-# STARTUP RECOVERY
-# ============================================================
-
-async def recover_active_games(
-    self,
-) -> list[dict[str, Any]]:
-
-    """
-    Recover games entirely from persistent database state.
-
-    This is called after Render starts/restarts.
-
-    Nothing here depends on an in-memory timer surviving.
-    """
-
-    games = await self.db.get_recoverable_games()
-
-    recovery: list[
-        dict[str, Any]
-    ] = []
-
-    now = self.now_utc()
-
-    for game in games:
-
-        status = game.get(
-            "status"
+            round_number,
         )
 
-        if status == self.STATUS_LOBBY:
+        return await self._resolve_round(
+            game=game,
+            players=players,
+            decisions=decisions,
+            round_number=round_number,
+            force_timeout=True,
+        )
 
-            deadline = self.parse_timestamp(
-                game.get(
-                    "join_deadline"
-                )
-            )
+    # ============================================================
+    # START/LOBBY RECOVERY
+    # ============================================================
 
-            if (
-                deadline is not None
-                and now >= deadline
-            ):
-                recovery.append(
-                    {
-                        "game_id": game["id"],
-                        "action": "finish_lobby",
-                    }
-                )
+    async def finish_lobby(
+        self,
+        game_id: str,
+    ) -> dict[str, Any] | None:
+        game = await self.get_game(
+            game_id
+        )
 
-        elif status in {
-            self.STATUS_PLAYING,
-            self.STATUS_RESOLVING,
-        }:
-
-            deadline = self.parse_timestamp(
-                game.get(
-                    "decision_deadline"
-                )
-            )
-
-            if (
-                status == self.STATUS_RESOLVING
-                or (
-                    deadline is not None
-                    and now >= deadline
-                )
-            ):
-                recovery.append(
-                    {
-                        "game_id": game["id"],
-                        "action": "resolve_round",
-                    }
-                )
-
-    return recovery
-
-async def recover_game(
-    self,
-    game_id: str,
-) -> dict[str, Any] | None:
-
-    game = await self.get_game(
-        game_id
-    )
-
-    status = game.get(
-        "status"
-    )
-
-    if status == self.STATUS_LOBBY:
+        if game.get("status") != self.STATUS_LOBBY:
+            return None
 
         deadline = self.parse_timestamp(
             game.get(
@@ -1553,234 +1463,303 @@ async def recover_game(
             )
         )
 
-        if (
-            deadline is not None
-            and self.now_utc() >= deadline
-        ):
+        if deadline is not None:
+            if self.now_utc() < deadline:
+                return None
+
+        players = await self.db.get_players(
+            game_id
+        )
+
+        eligible = [
+            player
+            for player in players
+            if self.is_counted_player(
+                player
+            )
+        ]
+
+        if not eligible:
+            await self.db.cancel_game_atomic(
+                game_id
+            )
+
+            await self.db.append_event(
+                game_id=game_id,
+                event_type="game_cancelled",
+                round_number=0,
+                payload={
+                    "reason": "empty_lobby",
+                },
+            )
+
+            return None
+
+        try:
+            return await self.start_game(
+                game_id=game_id
+            )
+
+        except DatabaseConflict:
+            # Another worker started it.
+            return await self.db.get_game(
+                game_id
+            )
+
+    async def recover_game(
+        self,
+        game: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        game_id = str(
+            game["id"]
+        )
+
+        status = game.get(
+            "status"
+        )
+
+        if status == self.STATUS_LOBBY:
             return await self.finish_lobby(
                 game_id
             )
 
-        return None
-
-    if status in {
-        self.STATUS_PLAYING,
-        self.STATUS_RESOLVING,
-    }:
-
-        return await self.resolve_if_expired(
-            game_id
-        )
-
-    return None
-
-async def finish_lobby(
-    self,
-    game_id: str,
-) -> dict[str, Any] | None:
-
-    game, players = (
-        await self.get_game_with_players(
-            game_id
-        )
-    )
-
-    if game.get(
-        "status"
-    ) != self.STATUS_LOBBY:
-        return None
-
-    eligible = [
-        player
-        for player in players
-        if self.is_counted_player(
-            player
-        )
-    ]
-
-    if not eligible:
-
-        await self.db.cancel_game_atomic(
-            game_id
-        )
-
-        await self.db.append_event(
-            game_id=game_id,
-            event_type="game_cancelled",
-            payload={
-                "reason": "no_players",
-            },
-        )
-
-        return {
-            "cancelled": True,
-            "reason": "no_players",
-        }
-
-    return await self.start_game(
-        game_id
-    )
-
-async def recover_all_due_games(
-    self,
-) -> list[dict[str, Any]]:
-
-    items = await self.recover_active_games()
-
-    results: list[
-        dict[str, Any]
-    ] = []
-
-    for item in items:
-
-        game_id = item[
-            "game_id"
-        ]
-
-        try:
-
-            result = await self.recover_game(
-                game_id
+        if status == self.STATUS_PLAYING:
+            return await self.resolve_round_if_due(
+                game_id=game_id
             )
 
-            if result is not None:
-                results.append(
-                    {
-                        "game_id": game_id,
-                        "result": result,
-                    }
-                )
-
-        except Exception:
-
-            logger.exception(
-                "Failed recovering game %s.",
+        if status == self.STATUS_RESOLVING:
+            # A previous worker may have died after claiming
+            # resolution. The database remains authoritative.
+            #
+            # Re-read the game and only attempt recovery when the
+            # stored resolution state permits it.
+            logger.info(
+                "Recovering resolving game %s",
                 game_id,
             )
 
-    return results
+            refreshed = await self.db.get_game(
+                game_id
+            )
 
-# ============================================================
-# PLAYER ROLE / CHOICE ACCESS
-# ============================================================
+            if not refreshed:
+                return None
 
-async def get_player_role(
-    self,
-    game_id: str,
-    user_id: int,
-) -> dict[str, Any]:
+            return await self.resolve_round_if_due(
+                game_id=game_id
+            )
 
-    game = await self.get_game(
-        game_id
-    )
+        return None
 
-    player = await self.db.get_player(
-        game_id,
-        user_id,
-    )
+    async def recover_active_games(
+        self,
+    ) -> list[dict[str, Any]]:
+        games = await self.db.get_recoverable_games()
 
-    if not player:
-        raise ValueError(
-            "Player does not exist."
+        results: list[dict[str, Any]] = []
+
+        for game in games:
+            try:
+                result = await self.recover_game(
+                    game
+                )
+
+                if result is not None:
+                    results.append(
+                        result
+                    )
+
+            except Exception:
+                logger.exception(
+                    "Failed to recover game %s",
+                    game.get("id"),
+                )
+
+        return results
+
+    async def recover_all_due_games(
+        self,
+    ) -> list[dict[str, Any]]:
+        """
+        Recovery entry point for application startup.
+
+        The database supplies recoverable games. No Python
+        process-local timer is required.
+        """
+
+        results: list[dict[str, Any]] = []
+
+        try:
+            pending_lobbies = (
+                await self.db.get_pending_lobbies()
+            )
+
+            for game in pending_lobbies:
+                try:
+                    result = await self.finish_lobby(
+                        game["id"]
+                    )
+
+                    if result:
+                        results.append(
+                            result
+                        )
+
+                except Exception:
+                    logger.exception(
+                        "Failed to recover lobby %s",
+                        game.get("id"),
+                    )
+
+        except Exception:
+            logger.exception(
+                "Failed to recover pending lobbies."
+            )
+
+        try:
+            expired_games = (
+                await self.db.get_expired_decision_games()
+            )
+
+            for game in expired_games:
+                try:
+                    result = await self.resolve_round_if_due(
+                        game_id=game["id"]
+                    )
+
+                    if result:
+                        results.append(
+                            result
+                        )
+
+                except Exception:
+                    logger.exception(
+                        "Failed to recover expired game %s",
+                        game.get("id"),
+                    )
+
+        except Exception:
+            logger.exception(
+                "Failed to recover expired games."
+            )
+
+        return results
+
+    # ============================================================
+    # ROLE / UI DATA
+    # ============================================================
+
+    async def get_player_role(
+        self,
+        *,
+        game_id: str,
+        user_id: int,
+    ) -> dict[str, Any] | None:
+        game = await self.get_game(
+            game_id
         )
 
-    role_id = player.get(
-        "role_id"
-    )
-
-    if not role_id:
-        raise ValueError(
-            "Player has no assigned role."
+        player = await self.db.get_player(
+            game_id,
+            user_id,
         )
 
-    engine = self.engine_for_game(
-        game
-    )
+        if not player:
+            return None
 
-    return engine.get_role(
-        role_id
-    )
-
-async def get_player_choices(
-    self,
-    game_id: str,
-    user_id: int,
-) -> list[dict[str, Any]]:
-
-    game = await self.get_game(
-        game_id
-    )
-
-    player = await self.db.get_player(
-        game_id,
-        user_id,
-    )
-
-    if not player:
-        return []
-
-    round_number = int(
-        game.get(
-            "current_round",
-            0,
+        role_id = player.get(
+            "role_id"
         )
-        or 0
-    )
 
-    if not self.is_required_for_round(
-        player,
-        round_number,
-    ):
-        return []
+        if not role_id:
+            return None
 
-    role_id = player.get(
-        "role_id"
-    )
-
-    scene_id = game.get(
-        "current_scene_id"
-    )
-
-    if not role_id or not scene_id:
-        return []
-
-    engine = self.engine_for_game(
-        game
-    )
-
-    scene = engine.get_scene(
-        scene_id
-    )
-
-    return engine.choices_for_role(
-        scene,
-        role_id,
-        game.get(
-            "world_state"
+        engine = self.engine_for_game(
+            game
         )
-        or {},
-    )
 
-# ============================================================
-# GAME EVENTS
-# ============================================================
+        return engine.get_role(
+            str(role_id)
+        )
 
-async def record_event(
-    self,
-    *,
-    game_id: str,
-    event_type: str,
-    round_number: int | None = None,
-    user_id: int | None = None,
-    payload: dict[str, Any] | None = None,
-    event_id: str | None = None,
-) -> dict[str, Any]:
+    async def get_player_choices(
+        self,
+        *,
+        game_id: str,
+        user_id: int,
+    ) -> list[dict[str, Any]]:
+        game = await self.get_game(
+            game_id
+        )
 
-    return await self.db.append_event(
-        game_id=game_id,
-        event_type=event_type,
-        round_number=round_number,
-        user_id=user_id,
-        payload=payload or {},
-        event_id=event_id,
-    )
+        player = await self.db.get_player(
+            game_id,
+            user_id,
+        )
+
+        if not player:
+            raise ValueError(
+                "Player does not exist."
+            )
+
+        role_id = player.get(
+            "role_id"
+        )
+
+        if not role_id:
+            return []
+
+        scene_id = game.get(
+            "current_scene_id"
+        )
+
+        if not scene_id:
+            return []
+
+        engine = self.engine_for_game(
+            game
+        )
+
+        scene = engine.get_scene(
+            scene_id
+        )
+
+        world_state = (
+            game.get(
+                "world_state"
+            )
+            or await self.db.get_world_state(
+                game_id
+            )
+            or engine.initial_world_state()
+        )
+
+        return engine.choices_for_role(
+            scene,
+            str(role_id),
+            world_state,
+        )
+
+    # ============================================================
+    # EVENTS
+    # ============================================================
+
+    async def record_event(
+        self,
+        *,
+        game_id: str,
+        event_type: str,
+        round_number: int | None = None,
+        user_id: int | None = None,
+        payload: dict[str, Any] | None = None,
+        event_id: str | None = None,
+    ) -> None:
+        await self.db.append_event(
+            game_id=game_id,
+            event_type=event_type,
+            round_number=round_number,
+            user_id=user_id,
+            payload=payload or {},
+            event_id=event_id,
+        )
