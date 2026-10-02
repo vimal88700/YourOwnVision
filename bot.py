@@ -28,7 +28,7 @@ logging.basicConfig(level=logging.INFO)
 
 gemini = genai.Client(api_key=GEMINI_API_KEY)
 
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-3.8-flash"
 
 
 FALLBACK_ROUNDS = [
