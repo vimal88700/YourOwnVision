@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -19,12 +20,12 @@ logger = logging.getLogger("YourOwnVision.story_generator")
 
 
 # ============================================================
-# GEMINI OUTPUT MODELS
+# PYDANTIC STORY SCHEMA
 # ============================================================
 
 
 class GeneratedSecret(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
     id: str
     owner: str | None = None
@@ -33,7 +34,7 @@ class GeneratedSecret(BaseModel):
 
 
 class GeneratedKnowledge(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
     role_id: str
     knowledge: str
@@ -41,7 +42,7 @@ class GeneratedKnowledge(BaseModel):
 
 
 class GeneratedRelationshipEffect(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
     role_a: str
     role_b: str
@@ -49,15 +50,11 @@ class GeneratedRelationshipEffect(BaseModel):
 
 
 class GeneratedEffects(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
     set_flags: dict[str, Any] = Field(default_factory=dict)
     remove_flags: list[str] = Field(default_factory=list)
-
-    set_variables: dict[str, Any] = Field(
-        default_factory=dict
-    )
-
+    set_variables: dict[str, Any] = Field(default_factory=dict)
     add_variables: dict[str, int | float] = Field(
         default_factory=dict
     )
@@ -83,7 +80,7 @@ class GeneratedEffects(BaseModel):
 
 
 class GeneratedCondition(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
     type: str
     name: str | None = None
@@ -98,11 +95,10 @@ class GeneratedCondition(BaseModel):
 
 
 class GeneratedChoice(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
     id: str
     label: str
-
     public_event: str = ""
 
     next_scene: str | None = None
@@ -121,7 +117,7 @@ class GeneratedChoice(BaseModel):
 
 
 class GeneratedTransition(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
     next_scene: str
 
@@ -131,7 +127,7 @@ class GeneratedTransition(BaseModel):
 
 
 class GeneratedEnding(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
     id: str
     text: str
@@ -142,7 +138,7 @@ class GeneratedEnding(BaseModel):
 
 
 class GeneratedLateJoin(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
     allowed: bool = True
 
@@ -158,7 +154,7 @@ class GeneratedLateJoin(BaseModel):
 
 
 class GeneratedRole(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
     id: str
     name: str
@@ -168,7 +164,7 @@ class GeneratedRole(BaseModel):
 
 
 class GeneratedScene(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
     id: str
     public_text: str
@@ -179,9 +175,7 @@ class GeneratedScene(BaseModel):
         default_factory=list
     )
 
-    choices: list[GeneratedChoice] = Field(
-        default_factory=list
-    )
+    choices: list[GeneratedChoice]
 
     transitions: list[GeneratedTransition] = Field(
         default_factory=list
@@ -195,7 +189,7 @@ class GeneratedScene(BaseModel):
 
 
 class GeneratedStory(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
     title: str
 
@@ -207,38 +201,75 @@ class GeneratedStory(BaseModel):
 
 
 # ============================================================
+# INTERNAL ERROR TYPES
+# ============================================================
+
+
+class GeminiQuotaExhausted(RuntimeError):
+    """
+    Gemini returned a quota/rate-limit exhaustion error.
+
+    IMPORTANT:
+    A daily free-tier quota error must NOT be retried repeatedly.
+    """
+
+
+class GeminiTemporaryError(RuntimeError):
+    """
+    Gemini returned a temporary server/capacity error.
+    """
+
+
+# ============================================================
 # STORY GENERATOR
 # ============================================================
 
 
 class StoryGenerator:
     """
-    Generates story DATA with Gemini.
+    Generates WHAT HAPPENS? story content.
 
-    Gemini creates the story.
-    GameEngine/GameService handles gameplay.
+    Architecture:
 
-    This implementation deliberately uses normal JSON output
-    and validates the result locally with Pydantic and the
-    existing StoryValidator.
+        Gemini available
+            |
+            v
+        generate JSON
+            |
+            v
+        Pydantic validation
+            |
+            v
+        StoryValidator
+            |
+            v
+        game
+
+    If Gemini is unavailable, quota-exhausted, invalid, or temporarily
+    overloaded, a deterministic local fallback story is generated and
+    passed through the EXACT SAME validation pipeline.
+
+    This means Gemini is an enhancement, not a single point of failure.
     """
 
     DEFAULT_MODEL = "gemini-3.8-flash"
 
     FALLBACK_MODELS = (
+        "gemini-3.8-flash",
         "gemini-3.7-flash",
         "gemini-3.6-flash",
         "gemini-3.5-flash",
     )
 
-    # Retry temporary Gemini capacity/server errors.
-    MAX_RETRIES_PER_MODEL = 3
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # Never do 4 retries for a daily quota error.
+    # --------------------------------------------------------
+
+    MAX_RETRIES_PER_MODEL = 2
 
     INITIAL_RETRY_DELAY_SECONDS = 2.0
-    MAX_RETRY_DELAY_SECONDS = 12.0
-
-    # If Gemini returns malformed JSON/schema, regenerate.
-    MAX_GENERATION_ATTEMPTS = 2
+    MAX_RETRY_DELAY_SECONDS = 8.0
 
     MIN_PLAYERS = 1
     MAX_PLAYERS = 20
@@ -249,9 +280,9 @@ class StoryGenerator:
     MIN_TIMER_SECONDS = 10
     MAX_TIMER_SECONDS = 3600
 
-    # ------------------------------------------------------------
-    # INITIALIZATION
-    # ------------------------------------------------------------
+    # Number of different local fallback structures that may
+    # be attempted if one already exists in story_history.
+    MAX_FALLBACK_VARIANTS = 20
 
     def __init__(
         self,
@@ -277,9 +308,9 @@ class StoryGenerator:
             api_key=api_key.strip()
         )
 
-    # ------------------------------------------------------------
-    # PUBLIC GENERATION METHOD
-    # ------------------------------------------------------------
+    # ========================================================
+    # PUBLIC GENERATION API
+    # ========================================================
 
     async def generate(
         self,
@@ -296,207 +327,219 @@ class StoryGenerator:
             for value in (
                 previous_fingerprints or []
             )
-            if (
-                isinstance(value, str)
-                and value.strip()
-            )
+            if isinstance(value, str)
+            and value.strip()
         ]
 
-        models = self._get_models_to_try()
+        logger.info(
+            "Starting story generation. "
+            "players=%s models=%s",
+            player_count,
+            self._get_models_to_try(),
+        )
+
+        # ----------------------------------------------------
+        # GEMINI
+        # ----------------------------------------------------
+
+        gemini_story = await self._try_gemini(
+            player_count=player_count,
+            previous_fingerprints=fingerprints,
+        )
+
+        if gemini_story is not None:
+
+            try:
+                validated_story, fingerprint = (
+                    self._validate_and_fingerprint(
+                        gemini_story,
+                        player_count=player_count,
+                        previous_fingerprints=fingerprints,
+                    )
+                )
+
+                logger.info(
+                    "Gemini story generation succeeded. "
+                    "model=%s fingerprint=%s",
+                    self.model,
+                    fingerprint,
+                )
+
+                return (
+                    validated_story,
+                    fingerprint,
+                )
+
+            except StoryValidationError as exc:
+
+                logger.warning(
+                    "Gemini story failed local validation: %s",
+                    exc,
+                )
+
+            except Exception:
+
+                logger.exception(
+                    "Unexpected error while validating "
+                    "Gemini story."
+                )
+
+        # ----------------------------------------------------
+        # LOCAL FALLBACK
+        # ----------------------------------------------------
+
+        logger.warning(
+            "Gemini unavailable or unusable. "
+            "Switching to local fallback story."
+        )
+
+        fallback = self._generate_fallback_story(
+            player_count=player_count,
+            previous_fingerprints=fingerprints,
+        )
+
+        validated_story, fingerprint = (
+            self._validate_and_fingerprint(
+                fallback,
+                player_count=player_count,
+                previous_fingerprints=fingerprints,
+            )
+        )
+
+        logger.warning(
+            "Local fallback story ready. "
+            "fingerprint=%s",
+            fingerprint,
+        )
+
+        return (
+            validated_story,
+            fingerprint,
+        )
+
+    # ========================================================
+    # GEMINI PIPELINE
+    # ========================================================
+
+    async def _try_gemini(
+        self,
+        *,
+        player_count: int,
+        previous_fingerprints: list[str],
+    ) -> dict[str, Any] | None:
+
+        prompt = self._build_prompt(
+            player_count=player_count,
+            previous_fingerprints=previous_fingerprints,
+        )
 
         last_error: Exception | None = None
 
-        logger.info(
-            "Starting Gemini story generation. "
-            "players=%s models=%s",
-            player_count,
-            models,
-        )
+        for model_name in self._get_models_to_try():
 
-        # --------------------------------------------------------
-        # TRY EACH MODEL
-        # --------------------------------------------------------
+            try:
 
-        for model_name in models:
-
-            for generation_attempt in range(
-                1,
-                self.MAX_GENERATION_ATTEMPTS + 1,
-            ):
-
-                prompt = self._build_prompt(
-                    player_count=player_count,
-                    previous_fingerprints=fingerprints,
-                    attempt=generation_attempt,
+                response = await self._generate_with_retry(
+                    model_name=model_name,
+                    contents=prompt,
                 )
 
-                try:
+                self.model = model_name
 
-                    response = (
-                        await self._generate_json_with_retry(
-                            model_name=model_name,
-                            prompt=prompt,
-                        )
+                story = self._parse_gemini_response(
+                    response
+                )
+
+                if story is None:
+                    raise StoryValidationError(
+                        "Gemini returned no usable story."
                     )
 
-                    story = self._parse_response(
-                        response
-                    )
+                return story
 
-                    validated_story = (
-                        StoryValidator.validate(
-                            story,
-                            player_count=player_count,
-                        )
-                    )
+            except GeminiQuotaExhausted as exc:
 
-                    fingerprint = (
-                        StoryValidator.structural_fingerprint(
-                            validated_story
-                        )
-                    )
+                # ------------------------------------------------
+                # CRITICAL FIX:
+                #
+                # DO NOT retry daily quota errors.
+                #
+                # We also do not continue hammering every model
+                # after the same project quota is exhausted.
+                # ------------------------------------------------
 
-                    # ------------------------------------------------
-                    # DUPLICATE PROTECTION
-                    # ------------------------------------------------
+                last_error = exc
 
-                    if fingerprint in fingerprints:
+                logger.warning(
+                    "Gemini daily quota exhausted. "
+                    "Stopping Gemini attempts immediately. "
+                    "model=%s error=%s",
+                    model_name,
+                    exc,
+                )
 
-                        raise StoryValidationError(
-                            "Gemini generated a duplicate "
-                            "story structure."
-                        )
+                break
 
-                    self.model = model_name
+            except GeminiTemporaryError as exc:
 
-                    logger.info(
-                        "Story generation succeeded. "
-                        "model=%s attempt=%s "
-                        "fingerprint=%s",
-                        model_name,
-                        generation_attempt,
-                        fingerprint,
-                    )
+                last_error = exc
 
-                    return (
-                        validated_story,
-                        fingerprint,
-                    )
+                logger.warning(
+                    "Gemini temporary failure after bounded "
+                    "retries. Moving to next model. "
+                    "model=%s error=%s",
+                    model_name,
+                    exc,
+                )
 
-                except StoryValidationError as exc:
+                continue
 
-                    last_error = exc
+            except StoryValidationError as exc:
 
-                    logger.warning(
-                        "Story validation failed. "
-                        "model=%s attempt=%s/%s error=%s",
-                        model_name,
-                        generation_attempt,
-                        self.MAX_GENERATION_ATTEMPTS,
-                        exc,
-                    )
+                last_error = exc
 
-                except ValidationError as exc:
+                logger.warning(
+                    "Gemini response could not be parsed. "
+                    "model=%s error=%s",
+                    model_name,
+                    exc,
+                )
 
-                    last_error = exc
+                continue
 
-                    logger.warning(
-                        "Story schema validation failed. "
-                        "model=%s attempt=%s/%s error=%s",
-                        model_name,
-                        generation_attempt,
-                        self.MAX_GENERATION_ATTEMPTS,
-                        exc,
-                    )
+            except Exception as exc:
 
-                except Exception as exc:
+                last_error = exc
 
-                    last_error = exc
+                logger.warning(
+                    "Gemini generation failed. "
+                    "model=%s error=%s",
+                    model_name,
+                    exc,
+                )
 
-                    logger.warning(
-                        "Gemini generation failed. "
-                        "model=%s attempt=%s/%s error=%s",
-                        model_name,
-                        generation_attempt,
-                        self.MAX_GENERATION_ATTEMPTS,
-                        exc,
-                    )
+                # Invalid API key / invalid model / bad request:
+                # don't waste time retrying the same request.
+                if self._is_non_retryable_api_error(
+                    exc
+                ):
+                    continue
 
-        # --------------------------------------------------------
-        # EVERYTHING FAILED
-        # --------------------------------------------------------
-
-        detail = (
-            str(last_error).strip()
-            if last_error
-            else "Unknown Gemini error."
-        )
-
-        if not detail:
-            detail = "Unknown Gemini error."
-
-        if len(detail) > 1200:
-            detail = (
-                detail[:1200]
-                + "..."
+        if last_error is not None:
+            logger.warning(
+                "Gemini generation unavailable. "
+                "Local fallback will be used. "
+                "last_error=%s",
+                last_error,
             )
 
-        raise RuntimeError(
-            "Gemini story generation failed: "
-            + detail
-        ) from last_error
+        return None
 
-    # ============================================================
-    # MODEL LIST
-    # ============================================================
-
-    def _get_models_to_try(self) -> list[str]:
-
-        configured = os.getenv(
-            "GEMINI_FALLBACK_MODELS",
-            ",".join(
-                self.FALLBACK_MODELS
-            ),
-        )
-
-        candidates = [
-            self.model
-        ]
-
-        for item in configured.split(","):
-
-            item = item.strip()
-
-            if item:
-                candidates.append(item)
-
-        models: list[str] = []
-
-        for candidate in candidates:
-
-            candidate = (
-                candidate
-                .removeprefix("models/")
-                .strip()
-            )
-
-            if (
-                candidate
-                and candidate not in models
-            ):
-                models.append(candidate)
-
-        return models
-
-    # ============================================================
-    # GEMINI REQUEST WITH RETRY/BACKOFF
-    # ============================================================
-
-    async def _generate_json_with_retry(
+    async def _generate_with_retry(
         self,
         *,
         model_name: str,
-        prompt: str,
+        contents: str,
     ) -> Any:
 
         last_error: Exception | None = None
@@ -516,34 +559,21 @@ class StoryGenerator:
                     self.MAX_RETRIES_PER_MODEL,
                 )
 
-                # IMPORTANT:
-                #
-                # We intentionally do NOT send the complex
-                # Pydantic response_schema to Gemini here.
-                #
-                # Gemini returns normal JSON.
-                # Pydantic + StoryValidator validate it locally.
-                #
-                # This avoids the schema/API compatibility problem
-                # that was causing:
-                #
-                # "story data does not match required schema"
-                #
                 response = (
                     await self.client.aio.models.generate_content(
                         model=model_name,
-                        contents=prompt,
+                        contents=contents,
                         config=types.GenerateContentConfig(
                             response_mime_type="application/json",
                             system_instruction=(
-                                "You are the story-data "
+                                "You are the story-content "
                                 "generator for the "
                                 "WHAT HAPPENS? Telegram game. "
-                                "Return exactly one valid JSON "
-                                "object. "
-                                "No Markdown. "
-                                "No explanation. "
-                                "No executable code."
+                                "Generate story DATA ONLY. "
+                                "Return one valid JSON object. "
+                                "Never generate Python, SQL, "
+                                "Telegram API calls, tools, "
+                                "or executable code."
                             ),
                         ),
                     )
@@ -562,135 +592,181 @@ class StoryGenerator:
 
                 last_error = exc
 
-                retryable = (
-                    self._is_retryable_error(
-                        exc
-                    )
+                error_kind = (
+                    self._classify_gemini_error(exc)
                 )
 
-                # Non-temporary errors such as:
-                # invalid API key
-                # invalid argument
-                # permission errors
-                # should NOT be retried endlessly.
-                if not retryable:
+                # ------------------------------------------------
+                # DAILY QUOTA:
+                # ZERO RETRIES.
+                # ------------------------------------------------
 
-                    logger.error(
-                        "Permanent Gemini error. "
-                        "model=%s error=%s",
-                        model_name,
+                if error_kind == "quota":
+
+                    raise GeminiQuotaExhausted(
+                        str(exc)
+                    ) from exc
+
+                # ------------------------------------------------
+                # TEMPORARY 503 / server overload:
+                # limited retry.
+                # ------------------------------------------------
+
+                if error_kind == "temporary":
+
+                    if (
+                        attempt
+                        >= self.MAX_RETRIES_PER_MODEL
+                    ):
+                        raise GeminiTemporaryError(
+                            str(exc)
+                        ) from exc
+
+                    delay = self._calculate_retry_delay(
+                        attempt,
                         exc,
                     )
 
-                    raise
-
-                if (
-                    attempt
-                    >= self.MAX_RETRIES_PER_MODEL
-                ):
-
-                    logger.error(
-                        "Gemini retries exhausted. "
-                        "model=%s error=%s",
+                    logger.warning(
+                        "Temporary Gemini error. "
+                        "model=%s attempt=%s/%s "
+                        "retrying in %.1fs. "
+                        "error=%s",
                         model_name,
+                        attempt,
+                        self.MAX_RETRIES_PER_MODEL,
+                        delay,
                         exc,
                     )
 
-                    raise
+                    await asyncio.sleep(delay)
+                    continue
 
-                retry_after = (
-                    self._retry_after_seconds(
-                        exc
-                    )
-                )
+                # ------------------------------------------------
+                # Authentication / bad model / bad request:
+                # don't retry.
+                # ------------------------------------------------
 
-                if retry_after is not None:
-
-                    delay = min(
-                        retry_after,
-                        self.MAX_RETRY_DELAY_SECONDS,
-                    )
-
-                else:
-
-                    base = min(
-                        self.INITIAL_RETRY_DELAY_SECONDS
-                        * (
-                            2
-                            ** (
-                                attempt - 1
-                            )
-                        ),
-                        self.MAX_RETRY_DELAY_SECONDS,
-                    )
-
-                    jitter = random.uniform(
-                        0.0,
-                        base * 0.25,
-                    )
-
-                    delay = min(
-                        base + jitter,
-                        self.MAX_RETRY_DELAY_SECONDS,
-                    )
-
-                logger.warning(
-                    "Temporary Gemini error. "
-                    "model=%s attempt=%s/%s "
-                    "retrying in %.1fs. "
-                    "error=%s",
-                    model_name,
-                    attempt,
-                    self.MAX_RETRIES_PER_MODEL,
-                    delay,
-                    exc,
-                )
-
-                await asyncio.sleep(
-                    delay
-                )
+                raise exc
 
         if last_error is not None:
             raise last_error
 
         raise RuntimeError(
-            "Gemini request failed without an error."
+            "Gemini request ended without a result."
         )
 
-    # ============================================================
-    # RETRYABLE ERROR DETECTION
-    # ============================================================
+    # ========================================================
+    # GEMINI ERROR CLASSIFICATION
+    # ========================================================
 
     @staticmethod
-    def _is_retryable_error(
+    def _classify_gemini_error(
+        exc: Exception,
+    ) -> str:
+
+        text = str(exc).upper()
+
+        # Daily/free-tier quota exhaustion.
+        quota_markers = (
+            "RESOURCE_EXHAUSTED",
+            "GENERATE_CONTENT_FREE_TIER_REQUESTS",
+            "QUOTA EXCEEDED",
+            "QUOTAEXCEEDED",
+            "GENERATEREQUESTSPERDAYPERPROJECT",
+        )
+
+        if any(
+            marker in text
+            for marker in quota_markers
+        ):
+            return "quota"
+
+        # 429 can mean different things.
+        #
+        # If it says quota, it was already classified above.
+        # A generic 429 without quota text is treated as temporary.
+        if (
+            "429" in text
+            or "TOO MANY REQUESTS" in text
+        ):
+            return "temporary"
+
+        temporary_markers = (
+            "503",
+            "UNAVAILABLE",
+            "SERVICE UNAVAILABLE",
+            "500 INTERNAL",
+            "INTERNAL",
+            "502",
+            "504",
+            "DEADLINE_EXCEEDED",
+            "TIMED OUT",
+            "TIMEOUT",
+        )
+
+        if any(
+            marker in text
+            for marker in temporary_markers
+        ):
+            return "temporary"
+
+        return "permanent"
+
+    @staticmethod
+    def _is_non_retryable_api_error(
         exc: Exception,
     ) -> bool:
 
         text = str(exc).upper()
 
-        retryable_markers = (
-            "429",
-            "RESOURCE_EXHAUSTED",
-            "TOO MANY REQUESTS",
-            "500",
-            "INTERNAL",
-            "502",
-            "503",
-            "504",
-            "UNAVAILABLE",
-            "DEADLINE_EXCEEDED",
-            "TIMEOUT",
-            "TIMED OUT",
+        markers = (
+            "400 INVALID_ARGUMENT",
+            "API_KEY_INVALID",
+            "API KEY NOT VALID",
+            "401",
+            "403",
+            "404 NOT_FOUND",
+            "NOT_FOUND",
+            "INVALID_ARGUMENT",
         )
 
         return any(
             marker in text
-            for marker in retryable_markers
+            for marker in markers
         )
 
-    # ============================================================
-    # RETRY-AFTER PARSER
-    # ============================================================
+    def _calculate_retry_delay(
+        self,
+        attempt: int,
+        exc: Exception,
+    ) -> float:
+
+        retry_after = (
+            self._retry_after_seconds(exc)
+        )
+
+        if retry_after is not None:
+            return min(
+                retry_after,
+                self.MAX_RETRY_DELAY_SECONDS,
+            )
+
+        exponential = min(
+            self.INITIAL_RETRY_DELAY_SECONDS
+            * (2 ** (attempt - 1)),
+            self.MAX_RETRY_DELAY_SECONDS,
+        )
+
+        jitter = random.uniform(
+            0.0,
+            exponential * 0.25,
+        )
+
+        return min(
+            exponential + jitter,
+            self.MAX_RETRY_DELAY_SECONDS,
+        )
 
     @staticmethod
     def _retry_after_seconds(
@@ -717,7 +793,6 @@ class StoryGenerator:
                     value,
                     "total_seconds",
                 ):
-
                     return max(
                         0.0,
                         float(
@@ -736,37 +811,93 @@ class StoryGenerator:
             ):
                 pass
 
-        match = re.search(
-            r"retry[- ]after[^0-9]*"
-            r"(\d+(?:\.\d+)?)",
-            str(exc),
-            re.IGNORECASE,
+        text = str(exc)
+
+        # Examples:
+        # retryDelay: 27190s
+        # retry in 30s
+        patterns = (
+            r"retryDelay[^0-9]*(\d+(?:\.\d+)?)s",
+            r"retry\s+in\s+(\d+(?:\.\d+)?)s",
+            r"retry[- ]after[^0-9]*(\d+(?:\.\d+)?)",
         )
 
-        if match:
+        for pattern in patterns:
 
-            try:
+            match = re.search(
+                pattern,
+                text,
+                re.IGNORECASE,
+            )
 
-                return max(
-                    0.0,
-                    float(
-                        match.group(1)
-                    ),
-                )
+            if match:
 
-            except ValueError:
-                return None
+                try:
+                    return max(
+                        0.0,
+                        float(match.group(1)),
+                    )
+
+                except ValueError:
+                    pass
 
         return None
 
-    # ============================================================
-    # RESPONSE PARSING
-    # ============================================================
+    # ========================================================
+    # MODEL LIST
+    # ========================================================
 
-    @staticmethod
-    def _parse_response(
+    def _get_models_to_try(self) -> list[str]:
+
+        configured = os.getenv(
+            "GEMINI_FALLBACK_MODELS",
+            "",
+        )
+
+        candidates: list[str] = [
+            self.model,
+        ]
+
+        if configured.strip():
+
+            candidates.extend(
+                item.strip()
+                for item in configured.split(",")
+                if item.strip()
+            )
+
+        else:
+
+            candidates.extend(
+                self.FALLBACK_MODELS
+            )
+
+        models: list[str] = []
+
+        for candidate in candidates:
+
+            candidate = (
+                candidate
+                .removeprefix("models/")
+                .strip()
+            )
+
+            if (
+                candidate
+                and candidate not in models
+            ):
+                models.append(candidate)
+
+        return models
+
+    # ========================================================
+    # GEMINI RESPONSE PARSING
+    # ========================================================
+
+    def _parse_gemini_response(
+        self,
         response: Any,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
 
         parsed = getattr(
             response,
@@ -780,25 +911,18 @@ class StoryGenerator:
             None,
         )
 
-        # --------------------------------------------------------
-        # SDK PARSED OBJECT
-        # --------------------------------------------------------
-
+        # Structured response if the SDK provides one.
         if parsed is not None:
 
-            if isinstance(
-                parsed,
-                GeneratedStory,
-            ):
+            try:
 
-                return parsed.model_dump(
-                    mode="json"
-                )
-
-            if isinstance(
-                parsed,
-                dict,
-            ):
+                if isinstance(
+                    parsed,
+                    GeneratedStory,
+                ):
+                    return parsed.model_dump(
+                        mode="json"
+                    )
 
                 generated = (
                     GeneratedStory.model_validate(
@@ -809,116 +933,726 @@ class StoryGenerator:
                 return generated.model_dump(
                     mode="json"
                 )
+
+            except ValidationError as exc:
+
+                raise StoryValidationError(
+                    "Gemini structured response "
+                    "did not match the story schema."
+                ) from exc
+
+        # Plain JSON response.
+        if raw_text:
+
+            cleaned = raw_text.strip()
+
+            # Remove Markdown fences if a model ignored
+            # the instruction.
+            if cleaned.startswith("```"):
+
+                lines = cleaned.splitlines()
+
+                if (
+                    lines
+                    and lines[0]
+                    .strip()
+                    .startswith("```")
+                ):
+                    lines = lines[1:]
+
+                if (
+                    lines
+                    and lines[-1]
+                    .strip()
+                    == "```"
+                ):
+                    lines = lines[:-1]
+
+                cleaned = "\n".join(
+                    lines
+                ).strip()
+
+            try:
+
+                data = json.loads(
+                    cleaned
+                )
+
+            except json.JSONDecodeError as exc:
+
+                raise StoryValidationError(
+                    "Gemini returned invalid JSON."
+                ) from exc
 
             try:
 
                 generated = (
                     GeneratedStory.model_validate(
-                        parsed
+                        data
                     )
                 )
 
-                return generated.model_dump(
-                    mode="json"
-                )
+            except ValidationError as exc:
 
-            except ValidationError:
-                pass
+                raise StoryValidationError(
+                    "Gemini returned JSON that "
+                    "does not match the story schema."
+                ) from exc
 
-        # --------------------------------------------------------
-        # RAW JSON TEXT
-        # --------------------------------------------------------
-
-        if not raw_text:
-
-            raise StoryValidationError(
-                "Gemini returned no story content."
+            return generated.model_dump(
+                mode="json"
             )
 
-        cleaned = raw_text.strip()
+        return None
 
-        # --------------------------------------------------------
-        # REMOVE MARKDOWN JSON FENCES
-        # --------------------------------------------------------
+    # ========================================================
+    # VALIDATION
+    # ========================================================
 
-        if cleaned.startswith("```"):
-
-            lines = (
-                cleaned.splitlines()
-            )
-
-            if (
-                lines
-                and lines[0]
-                .strip()
-                .startswith("```")
-            ):
-
-                lines = lines[1:]
-
-            if (
-                lines
-                and lines[-1]
-                .strip()
-                == "```"
-            ):
-
-                lines = lines[:-1]
-
-            cleaned = (
-                "\n".join(lines)
-                .strip()
-            )
-
-        # --------------------------------------------------------
-        # JSON DECODE
-        # --------------------------------------------------------
+    def _validate_and_fingerprint(
+        self,
+        story: dict[str, Any],
+        *,
+        player_count: int,
+        previous_fingerprints: list[str],
+    ) -> tuple[dict[str, Any], str]:
 
         try:
 
-            data = json.loads(
-                cleaned
+            validated_story = (
+                StoryValidator.validate(
+                    story,
+                    player_count=player_count,
+                )
             )
 
-        except json.JSONDecodeError as exc:
+        except StoryValidationError:
+            raise
+
+        except Exception as exc:
+
+            logger.exception(
+                "Story failed semantic validation."
+            )
 
             raise StoryValidationError(
-                "Gemini returned invalid JSON."
+                "Story failed semantic validation."
             ) from exc
 
-        if not isinstance(
-            data,
-            dict,
-        ):
+        fingerprint = (
+            StoryValidator.structural_fingerprint(
+                validated_story
+            )
+        )
+
+        if fingerprint in previous_fingerprints:
 
             raise StoryValidationError(
-                "Gemini returned JSON that "
-                "is not an object."
+                "Story structure duplicates "
+                "a previous story."
             )
 
-        # --------------------------------------------------------
-        # PYDANTIC VALIDATION
-        # --------------------------------------------------------
+        return (
+            validated_story,
+            fingerprint,
+        )
 
-        generated = (
-            GeneratedStory.model_validate(
-                data
+    # ========================================================
+    # LOCAL FALLBACK STORY
+    # ========================================================
+
+    def _generate_fallback_story(
+        self,
+        *,
+        player_count: int,
+        previous_fingerprints: list[str],
+    ) -> dict[str, Any]:
+
+        logger.warning(
+            "Building local fallback story. "
+            "player_count=%s",
+            player_count,
+        )
+
+        for variant in range(
+            self.MAX_FALLBACK_VARIANTS
+        ):
+
+            story = self._build_fallback_variant(
+                player_count=player_count,
+                variant=variant,
             )
+
+            try:
+
+                validated, fingerprint = (
+                    self._validate_and_fingerprint(
+                        story,
+                        player_count=player_count,
+                        previous_fingerprints=(
+                            previous_fingerprints
+                        ),
+                    )
+                )
+
+                logger.info(
+                    "Validated local fallback story. "
+                    "variant=%s fingerprint=%s",
+                    variant,
+                    fingerprint,
+                )
+
+                return validated
+
+            except Exception as exc:
+
+                logger.warning(
+                    "Fallback variant %s rejected: %s",
+                    variant,
+                    exc,
+                )
+
+        raise StoryValidationError(
+            "Unable to create a valid local fallback story."
         )
 
-        return generated.model_dump(
-            mode="json"
+    def _build_fallback_variant(
+        self,
+        *,
+        player_count: int,
+        variant: int,
+    ) -> dict[str, Any]:
+
+        variant_pack = self._fallback_variant_pack(
+            variant
         )
 
-    # ============================================================
+        prefix = (
+            f"local_{variant}_"
+        )
+
+        roles: list[dict[str, Any]] = []
+
+        role_names = [
+            "Suspicious Intern",
+            "Overconfident Detective",
+            "Snack Scientist",
+            "Confused Mayor",
+            "Time Traveler",
+            "Professional Nodding Expert",
+            "Unlicensed Magician",
+            "Emergency Penguin Consultant",
+            "Mystery Gardener",
+            "Captain of Bad Ideas",
+            "Accidental Billionaire",
+            "Neighborhood Wizard",
+            "Invisible Accountant",
+            "Drama Specialist",
+            "Chief Button Presser",
+            "Part-Time Astronaut",
+            "Secret Karaoke Judge",
+            "Professional Queue Skipper",
+            "Museum Escape Artist",
+            "Department of Weird Things",
+        ]
+
+        role_secrets = [
+            "You secretly believe every problem can be solved with snacks.",
+            "You are convinced someone here is hiding a ridiculous secret.",
+            "You have been pretending to understand everything.",
+            "You accidentally promised to fix the situation.",
+            "You know one completely unnecessary fact that may become important.",
+            "You are trying very hard to look responsible.",
+            "You suspect the most obvious answer is probably wrong.",
+            "You desperately want everyone to think your plan was intentional.",
+        ]
+
+        for index in range(
+            player_count
+        ):
+
+            roles.append(
+                {
+                    "id": f"{prefix}role_{index + 1}",
+                    "name": (
+                        role_names[
+                            (
+                                index + variant
+                            )
+                            % len(role_names)
+                        ]
+                        + (
+                            f" #{index + 1}"
+                            if player_count > 1
+                            else ""
+                        )
+                    ),
+                    "secret_description": (
+                        role_secrets[
+                            (
+                                index + variant
+                            )
+                            % len(role_secrets)
+                        ]
+                    ),
+                    "playable": True,
+                }
+            )
+
+        role_ids = [
+            role["id"]
+            for role in roles
+        ]
+
+        # ----------------------------------------------------
+        # Scene 1
+        # ----------------------------------------------------
+
+        scene_one = {
+            "id": f"{prefix}scene_1",
+            "public_text": (
+                f"{variant_pack['opening']} "
+                f"There are {player_count} suspicious people "
+                "in the room, and everyone insists this is "
+                "completely normal."
+            ),
+            "timer_seconds": 45,
+            "eligible_roles": role_ids,
+            "choices": [
+                {
+                    "id": f"{prefix}choice_1a",
+                    "label": variant_pack["choice_a"],
+                    "public_event": (
+                        "Someone makes a bold move "
+                        "with absolutely no evidence."
+                    ),
+                    "next_scene": f"{prefix}scene_2",
+                    "effects": {
+                        "set_flags": {
+                            f"{prefix}bold_move": True
+                        },
+                        "text": (
+                            "A bold move has been made."
+                        ),
+                    },
+                    "conditions": [],
+                    "branch_priority": 0,
+                },
+                {
+                    "id": f"{prefix}choice_1b",
+                    "label": variant_pack["choice_b"],
+                    "public_event": (
+                        "Someone chooses caution "
+                        "and immediately regrets it."
+                    ),
+                    "next_scene": f"{prefix}scene_2",
+                    "effects": {
+                        "set_flags": {
+                            f"{prefix}cautious": True
+                        },
+                        "text": (
+                            "Caution has entered the room."
+                        ),
+                    },
+                    "conditions": [],
+                    "branch_priority": 0,
+                },
+            ],
+            "transitions": [],
+            "ending": None,
+            "late_join": {
+                "allowed": True,
+                "roles": role_ids,
+                "conditions": [],
+                "entry_scene": f"{prefix}scene_1",
+            },
+        }
+
+        # ----------------------------------------------------
+        # Scene 2
+        # ----------------------------------------------------
+
+        scene_two = {
+            "id": f"{prefix}scene_2",
+            "public_text": (
+                f"{variant_pack['middle']} "
+                "The situation has somehow become "
+                "more complicated despite nobody "
+                "doing anything useful."
+            ),
+            "timer_seconds": 40,
+            "eligible_roles": role_ids,
+            "choices": [
+                {
+                    "id": f"{prefix}choice_2a",
+                    "label": variant_pack["choice_c"],
+                    "public_event": (
+                        "The group chooses chaos."
+                    ),
+                    "next_scene": f"{prefix}scene_3",
+                    "effects": {
+                        "add_variables": {
+                            f"{prefix}chaos": 1
+                        },
+                        "text": (
+                            "Chaos has increased by one."
+                        ),
+                    },
+                    "conditions": [],
+                    "branch_priority": 0,
+                },
+                {
+                    "id": f"{prefix}choice_2b",
+                    "label": variant_pack["choice_d"],
+                    "public_event": (
+                        "The group attempts diplomacy."
+                    ),
+                    "next_scene": f"{prefix}scene_3",
+                    "effects": {
+                        "add_variables": {
+                            f"{prefix}diplomacy": 1
+                        },
+                        "text": (
+                            "Diplomacy has been attempted."
+                        ),
+                    },
+                    "conditions": [],
+                    "branch_priority": 0,
+                },
+            ],
+            "transitions": [],
+            "ending": None,
+            "late_join": {
+                "allowed": True,
+                "roles": role_ids,
+                "conditions": [],
+                "entry_scene": f"{prefix}scene_2",
+            },
+        }
+
+        # ----------------------------------------------------
+        # Scene 3 / ENDING
+        # ----------------------------------------------------
+
+        scene_three = {
+            "id": f"{prefix}scene_3",
+            "public_text": (
+                f"{variant_pack['ending_setup']} "
+                "Everyone looks at everyone else. "
+                "Nobody knows who caused this."
+            ),
+            "timer_seconds": 35,
+            "eligible_roles": role_ids,
+            "choices": [
+                {
+                    "id": f"{prefix}choice_3a",
+                    "label": variant_pack["choice_e"],
+                    "public_event": (
+                        "The group proudly accepts "
+                        "responsibility for absolutely nothing."
+                    ),
+                    "next_scene": None,
+                    "effects": {
+                        "set_flags": {
+                            f"{prefix}accepted_blame": True
+                        },
+                        "text": (
+                            "The group accepts responsibility."
+                        ),
+                    },
+                    "conditions": [],
+                    "branch_priority": 0,
+                },
+                {
+                    "id": f"{prefix}choice_3b",
+                    "label": variant_pack["choice_f"],
+                    "public_event": (
+                        "Everyone points at someone else."
+                    ),
+                    "next_scene": None,
+                    "effects": {
+                        "set_flags": {
+                            f"{prefix}pointed_fingers": True
+                        },
+                        "text": (
+                            "The blame has been redirected."
+                        ),
+                    },
+                    "conditions": [],
+                    "branch_priority": 0,
+                },
+            ],
+            "transitions": [],
+            "ending": {
+                "id": f"{prefix}ending",
+                "text": (
+                    f"{variant_pack['ending_text']} "
+                    "Against all odds, the group survives "
+                    "another completely unnecessary adventure."
+                ),
+                "conditions": [],
+            },
+            "late_join": {
+                "allowed": True,
+                "roles": role_ids,
+                "conditions": [],
+                "entry_scene": f"{prefix}scene_3",
+            },
+        }
+
+        return {
+            "title": variant_pack["title"],
+            "first_scene_id": f"{prefix}scene_1",
+            "roles": roles,
+            "scenes": [
+                scene_one,
+                scene_two,
+                scene_three,
+            ],
+        }
+
+    # ========================================================
+    # FALLBACK VARIANTS
+    # ========================================================
+
+    @staticmethod
+    def _fallback_variant_pack(
+        variant: int,
+    ) -> dict[str, str]:
+
+        packs = [
+            {
+                "title": "The Extremely Suspicious Sandwich",
+                "opening": (
+                    "A sandwich has appeared on the table "
+                    "with no explanation."
+                ),
+                "middle": (
+                    "The sandwich has somehow acquired "
+                    "political influence."
+                ),
+                "ending_setup": (
+                    "The sandwich is now demanding answers."
+                ),
+                "choice_a": "Interrogate the sandwich",
+                "choice_b": "Pretend the sandwich is normal",
+                "choice_c": "Hold a sandwich meeting",
+                "choice_d": "Offer the sandwich a promotion",
+                "choice_e": "Take credit for the sandwich",
+                "choice_f": "Blame the sandwich",
+                "ending_text": (
+                    "The sandwich is promoted to honorary team leader."
+                ),
+            },
+            {
+                "title": "The Button Nobody Should Press",
+                "opening": (
+                    "A giant red button appears beside the door."
+                ),
+                "middle": (
+                    "The button is now humming ominously."
+                ),
+                "ending_setup": (
+                    "The button begins counting down from three."
+                ),
+                "choice_a": "Press the button immediately",
+                "choice_b": "Stand several steps away",
+                "choice_c": "Ask the button politely",
+                "choice_d": "Put a hat on the button",
+                "choice_e": "Press it together",
+                "choice_f": "Accuse someone of pressing it",
+                "ending_text": (
+                    "The button does nothing, which is somehow worse."
+                ),
+            },
+            {
+                "title": "The Mystery Meeting",
+                "opening": (
+                    "Everyone has been invited to a meeting "
+                    "that nobody remembers scheduling."
+                ),
+                "middle": (
+                    "The meeting agenda simply says: 'Probably You.'"
+                ),
+                "ending_setup": (
+                    "A mysterious clipboard arrives."
+                ),
+                "choice_a": "Volunteer immediately",
+                "choice_b": "Hide behind someone",
+                "choice_c": "Invent an agenda",
+                "choice_d": "Vote for the clipboard",
+                "choice_e": "Declare the meeting successful",
+                "choice_f": "Declare someone else responsible",
+                "ending_text": (
+                    "The meeting ends with absolutely no useful result."
+                ),
+            },
+            {
+                "title": "The Emergency Pigeon",
+                "opening": (
+                    "An extremely serious-looking pigeon "
+                    "has entered the room."
+                ),
+                "middle": (
+                    "The pigeon appears to know more than everyone."
+                ),
+                "ending_setup": (
+                    "The pigeon places one mysterious object "
+                    "on the table."
+                ),
+                "choice_a": "Trust the pigeon",
+                "choice_b": "Question the pigeon",
+                "choice_c": "Offer the pigeon a chair",
+                "choice_d": "Pretend not to notice",
+                "choice_e": "Elect the pigeon",
+                "choice_f": "Blame the pigeon",
+                "ending_text": (
+                    "The pigeon leaves without explaining anything."
+                ),
+            },
+            {
+                "title": "Operation: Find the Missing Spoon",
+                "opening": (
+                    "The only spoon in the building has disappeared."
+                ),
+                "middle": (
+                    "Everyone suddenly has a different theory."
+                ),
+                "ending_setup": (
+                    "A spoon-shaped shadow appears on the wall."
+                ),
+                "choice_a": "Launch an investigation",
+                "choice_b": "Declare the spoon irrelevant",
+                "choice_c": "Search the obvious place",
+                "choice_d": "Search the least obvious place",
+                "choice_e": "Declare victory",
+                "choice_f": "Blame the nearest person",
+                "ending_text": (
+                    "The spoon is eventually found somewhere "
+                    "that nobody checked."
+                ),
+            },
+            {
+                "title": "The World's Least Secret Secret",
+                "opening": (
+                    "Someone announces that they have a secret."
+                ),
+                "middle": (
+                    "Unfortunately, everyone already knows it."
+                ),
+                "ending_setup": (
+                    "The secret becomes dramatically less secret."
+                ),
+                "choice_a": "Pretend to be surprised",
+                "choice_b": "Ask for the secret anyway",
+                "choice_c": "Create a bigger secret",
+                "choice_d": "Write it on a giant sign",
+                "choice_e": "Reveal the secret dramatically",
+                "choice_f": "Pretend nobody heard it",
+                "ending_text": (
+                    "The secret is officially classified as "
+                    "not very secret."
+                ),
+            },
+            {
+                "title": "The Elevator to Somewhere",
+                "opening": (
+                    "An elevator opens even though nobody pressed it."
+                ),
+                "middle": (
+                    "The elevator has no buttons except one "
+                    "labelled 'Definitely'."
+                ),
+                "ending_setup": (
+                    "The elevator doors begin closing."
+                ),
+                "choice_a": "Enter confidently",
+                "choice_b": "Wait for instructions",
+                "choice_c": "Press Definitely",
+                "choice_d": "Ask where it goes",
+                "choice_e": "Take the mysterious elevator",
+                "choice_f": "Let someone else go first",
+                "ending_text": (
+                    "The elevator opens on the same floor."
+                ),
+            },
+            {
+                "title": "The Completely Normal Treasure Map",
+                "opening": (
+                    "A treasure map appears underneath the snacks."
+                ),
+                "middle": (
+                    "The map claims the treasure is nearby."
+                ),
+                "ending_setup": (
+                    "The map points directly at the group."
+                ),
+                "choice_a": "Follow the map",
+                "choice_b": "Follow the snacks instead",
+                "choice_c": "Dig immediately",
+                "choice_d": "Ask for directions",
+                "choice_e": "Declare yourselves treasure",
+                "choice_f": "Hide the map",
+                "ending_text": (
+                    "The treasure turns out to be teamwork, "
+                    "which nobody requested."
+                ),
+            },
+        ]
+
+        selected = packs[
+            variant % len(packs)
+        ]
+
+        cycle = (
+            variant // len(packs)
+        )
+
+        if cycle == 0:
+            return dict(selected)
+
+        # Make subsequent fallback structures different enough
+        # to avoid repeatedly producing the exact same fingerprint.
+        suffix = f" Variant {cycle + 1}"
+
+        result = dict(selected)
+
+        result["title"] = (
+            selected["title"]
+            + suffix
+        )
+
+        result["opening"] = (
+            selected["opening"]
+            + f" This is incident #{cycle + 1}."
+        )
+
+        result["middle"] = (
+            selected["middle"]
+            + " The situation somehow feels familiar."
+        )
+
+        result["ending_setup"] = (
+            selected["ending_setup"]
+            + " Everyone becomes suspicious again."
+        )
+
+        result["ending_text"] = (
+            selected["ending_text"]
+            + f" This was attempt #{cycle + 1}."
+        )
+
+        return result
+
+    # ========================================================
     # PROMPT
-    # ============================================================
+    # ========================================================
 
     def _build_prompt(
         self,
+        *,
         player_count: int,
         previous_fingerprints: list[str],
-        attempt: int,
     ) -> str:
 
         previous_text = json.dumps(
@@ -927,164 +1661,139 @@ class StoryGenerator:
             separators=(",", ":"),
         )
 
-        correction = ""
+        return f"""
+Create one short, funny, absurd interactive group story
+for the Telegram game WHAT HAPPENS?.
 
-        if attempt > 1:
+NUMBER OF HUMAN PLAYERS:
+{player_count}
 
-            correction = (
-                "\n\nCORRECTION ATTEMPT:\n"
-                "The previous story generation did "
-                "not pass validation.\n"
-                "Be extremely strict about the JSON "
-                "structure.\n"
-                "Use only the requested fields.\n"
-                "Do not invent fields.\n"
-                "Every scene must be reachable.\n"
-                "Every non-ending scene must eventually "
-                "reach an ending.\n"
-            )
+Generate STORY DATA ONLY.
 
-        # IMPORTANT:
-        #
-        # This is deliberately assembled from normal strings.
-        # There is NO triple-quoted prompt here.
-        #
-        # Therefore the previous:
-        #
-        # SyntaxError: unterminated triple-quoted string
-        #
-        # cannot happen from this prompt.
+The Python GameEngine executes the story deterministically.
 
-        return (
-            "Create one short, funny, absurd "
-            "interactive group story for the "
-            "Telegram game WHAT HAPPENS?.\n\n"
+DO NOT generate:
+- Python
+- executable code
+- Telegram API calls
+- SQL
+- tools
+- scoring systems
+- coins
+- XP
+- levels
+- rankings
+- trivia
+- dangerous instructions
+- sexual content
+- hateful content
 
-            f"NUMBER OF HUMAN PLAYERS: "
-            f"{player_count}\n\n"
+ROLES:
 
-            "Generate STORY DATA ONLY.\n"
+Create exactly {player_count} to
+{max_roles(player_count)} playable roles.
 
-            "The Python GameEngine executes "
-            "the story deterministically.\n\n"
+Every playable role must have:
+- unique id
+- unique name
+- secret_description
+- playable=true
 
-            "DO NOT generate:\n"
-            "- Python\n"
-            "- executable code\n"
-            "- Telegram API calls\n"
-            "- SQL\n"
-            "- tools\n"
-            "- scoring systems\n"
-            "- coins\n"
-            "- XP\n"
-            "- levels\n"
-            "- rankings\n"
-            "- trivia\n"
-            "- dangerous instructions\n"
-            "- sexual content\n"
-            "- hateful content\n"
+SCENES:
 
-            f"{correction}\n"
+Create between
+{self.MIN_SCENES} and
+{self.MAX_SCENES}
+scenes.
 
-            "ROLES:\n"
-            f"Create exactly {player_count} "
-            f"to {max_roles(player_count)} "
-            "playable roles.\n"
+Every scene must contain:
+- id
+- public_text
+- timer_seconds
+- eligible_roles
+- choices
+- late_join
 
-            "Every playable role must have:\n"
-            "- unique id\n"
-            "- unique name\n"
-            "- secret_description\n"
-            "- playable=true\n\n"
+Timers must be between
+{self.MIN_TIMER_SECONDS}
+and
+{self.MAX_TIMER_SECONDS}
+seconds.
 
-            "SCENES:\n"
-            f"Create between {self.MIN_SCENES} "
-            f"and {self.MAX_SCENES} scenes.\n"
+Set first_scene_id to a valid scene.
 
-            "Every scene must contain:\n"
-            "- id\n"
-            "- public_text\n"
-            "- timer_seconds\n"
-            "- eligible_roles\n"
-            "- choices\n"
-            "- transitions\n"
-            "- ending\n"
-            "- late_join\n"
+CHOICES:
 
-            f"timer_seconds must be between "
-            f"{self.MIN_TIMER_SECONDS} and "
-            f"{self.MAX_TIMER_SECONDS}.\n"
+Every choice must contain:
+- id
+- label
+- public_event
+- effects
 
-            "first_scene_id must reference "
-            "an existing scene.\n\n"
+next_scene may be supplied.
 
-            "CHOICES:\n"
-            "Every choice must contain:\n"
-            "- id\n"
-            "- label\n"
-            "- public_event\n"
-            "- effects\n"
+If supplied, next_scene MUST reference
+an existing scene.
 
-            "next_scene is optional.\n"
-            "If next_scene exists, it must reference "
-            "an existing scene.\n\n"
+ALLOWED CONDITIONS:
+- flag
+- variable
+- knowledge
+- relationship
 
-            "ALLOWED CONDITION TYPES:\n"
-            "- flag\n"
-            "- variable\n"
-            "- knowledge\n"
-            "- relationship\n\n"
+ALLOWED OPERATORS:
+- eq
+- ne
+- gt
+- gte
+- lt
+- lte
+- contains
 
-            "ALLOWED OPERATORS:\n"
-            "- eq\n"
-            "- ne\n"
-            "- gt\n"
-            "- gte\n"
-            "- lt\n"
-            "- lte\n"
-            "- contains\n\n"
+ALLOWED EFFECT GROUPS:
+- set_flags
+- remove_flags
+- set_variables
+- add_variables
+- relationships
+- knowledge
+- secrets
+- character_state
+- text
+- description
 
-            "ALLOWED EFFECT GROUPS:\n"
-            "- set_flags\n"
-            "- remove_flags\n"
-            "- set_variables\n"
-            "- add_variables\n"
-            "- relationships\n"
-            "- knowledge\n"
-            "- secrets\n"
-            "- character_state\n"
-            "- text\n"
-            "- description\n\n"
+All role references must reference real roles.
 
-            "REFERENCE RULES:\n"
-            "- All role references must reference "
-            "real roles.\n"
-            "- All scene references must reference "
-            "real scenes.\n"
-            "- No duplicate IDs.\n"
-            "- first_scene_id must be valid.\n"
-            "- Every scene must be reachable.\n"
-            "- Every non-ending scene must have a "
-            "path to an ending.\n"
-            "- No dead-end non-ending scenes.\n"
-            "- Every scene must contain late_join.\n"
-            "- Late-join role references must be valid.\n\n"
+All scene references must reference real scenes.
 
-            "PREVIOUS STRUCTURAL FINGERPRINTS:\n"
-            f"{previous_text}\n\n"
+STORY GRAPH:
+- first_scene_id must be valid
+- every scene must be reachable
+- no unreachable scenes
+- no dead-end non-ending scenes
+- no duplicate IDs
+- no invalid references
+- the final path must contain an ending
 
-            "FINAL OUTPUT RULE:\n"
-            "Return ONLY ONE valid JSON object.\n"
-            "Do not use Markdown fences.\n"
-            "Do not add commentary.\n"
-            "Do not add explanations.\n"
-            "Do not put anything before or after "
-            "the JSON object."
-        )
+LATE JOIN:
 
-    # ============================================================
+Every scene must contain late_join.
+
+Late-join role references must be valid.
+
+Previous structural fingerprints:
+
+{previous_text}
+
+Return ONLY one valid JSON object.
+Do NOT use Markdown fences.
+Do NOT add explanations.
+Do NOT add commentary.
+"""
+
+    # ========================================================
     # PLAYER VALIDATION
-    # ============================================================
+    # ========================================================
 
     @classmethod
     def _validate_player_count(
@@ -1102,7 +1811,6 @@ class StoryGenerator:
                 bool,
             )
         ):
-
             raise ValueError(
                 "player_count must be an integer."
             )
@@ -1112,16 +1820,15 @@ class StoryGenerator:
             <= player_count
             <= cls.MAX_PLAYERS
         ):
-
             raise ValueError(
                 "player_count must be between "
                 f"{cls.MIN_PLAYERS} and "
                 f"{cls.MAX_PLAYERS}."
             )
 
-    # ============================================================
-    # CLOSE GEMINI CLIENT
-    # ============================================================
+    # ========================================================
+    # LIFECYCLE
+    # ========================================================
 
     async def close(
         self,
@@ -1142,16 +1849,16 @@ class StoryGenerator:
             None,
         )
 
-        if close_method is not None:
+        if close_method is None:
+            return
 
-            result = close_method()
+        result = close_method()
 
-            if hasattr(
-                result,
-                "__await__",
-            ):
-
-                await result
+        if hasattr(
+            result,
+            "__await__",
+        ):
+            await result
 
 
 # ============================================================
