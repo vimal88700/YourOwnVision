@@ -7,20 +7,14 @@ from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
-from telegram import MenuButtonWebApp, Update, WebAppInfo
-from telegram.ext import CommandHandler, MessageHandler, filters
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
-from bot import (
-    create_application,
-    db,
-    game_service,
-    process_update,
-    publish_current_scene,
-)
 from config import CONFIG
-from miniapp_api import mount_static, router as miniapp_router
+from database import Database
+from miniapp_api import configure_service, mount_static, router as miniapp_router
 from world_bot import world_play, world_start
-
+from world_service import WorldService
 
 logging.basicConfig(
     level=getattr(logging, CONFIG.log_level.upper(), logging.INFO),
@@ -28,10 +22,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("YourOwnVision.main")
 
-telegram_application = create_application()
-recovery_task: asyncio.Task[None] | None = None
+db = Database(CONFIG.supabase_url, CONFIG.supabase_service_key)
+world_service = WorldService(db)
+configure_service(db)
+telegram_application = Application.builder().token(CONFIG.telegram_token).build()
 shutdown_event = asyncio.Event()
-RECOVERY_INTERVAL_SECONDS = 10
+recovery_task: asyncio.Task[None] | None = None
 
 
 def webhook_url() -> str:
@@ -41,130 +37,71 @@ def webhook_url() -> str:
 
 
 async def configure_telegram() -> None:
-    url = webhook_url()
     await telegram_application.bot.set_webhook(
-        url=url,
+        url=webhook_url(),
         secret_token=CONFIG.telegram_webhook_secret,
         allowed_updates=["message", "callback_query"],
         drop_pending_updates=False,
     )
-    try:
-        await telegram_application.bot.set_chat_menu_button(
-            menu_button=MenuButtonWebApp(
-                text="🎮 Play",
-                web_app=WebAppInfo(url=CONFIG.public_base_url.rstrip("/") + "/app"),
-            )
-        )
-    except Exception:
-        logger.exception("Could not configure Telegram Mini App menu button.")
-    info = await telegram_application.bot.get_webhook_info()
-    logger.info(
-        "Telegram webhook registered: url=%s pending=%s last_error=%s",
-        info.url or "<empty>",
-        info.pending_update_count,
-        info.last_error_message or "<none>",
-    )
-
-
-class RecoveryContext:
-    def __init__(self, bot: Any) -> None:
-        self.bot = bot
-
-
-async def recover_games_and_publish() -> None:
-    results = await game_service.recover_all_due_games()
-    for item in results:
-        if not isinstance(item, dict):
-            continue
-        candidate = item.get("game") if isinstance(item.get("game"), dict) else item
-        if candidate.get("status") != game_service.STATUS_PLAYING:
-            continue
-        game_id = candidate.get("id")
-        if not game_id:
-            continue
-        try:
-            await publish_current_scene(RecoveryContext(telegram_application.bot), str(game_id))
-        except Exception:
-            logger.exception("Could not publish recovered game %s", game_id)
 
 
 async def recovery_loop() -> None:
-    try:
-        await recover_games_and_publish()
-    except Exception:
-        logger.exception("Initial legacy-game recovery failed.")
     while not shutdown_event.is_set():
         try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=RECOVERY_INTERVAL_SECONDS)
+            await world_service.activate_due_worlds()
+        except Exception:
+            logger.exception("World recovery tick failed")
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=15)
         except asyncio.TimeoutError:
             pass
-        if shutdown_event.is_set():
-            break
-        try:
-            await recover_games_and_publish()
-        except Exception:
-            logger.exception("Periodic legacy-game recovery failed.")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global recovery_task
     shutdown_event.clear()
+    telegram_application.bot_data["db"] = db
+    telegram_application.bot_data["world_service"] = world_service
+    telegram_application.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & filters.Regex(r"^/start(?:@\w+)?\s+(?:world_|invite_).+"),
+            world_start,
+        ),
+        group=-10,
+    )
+    telegram_application.add_handler(CommandHandler("play", world_play), group=-10)
     await telegram_application.initialize()
     await telegram_application.start()
     me = await telegram_application.bot.get_me()
     app.state.bot_username = me.username or ""
+    app.state.telegram_bot = telegram_application.bot
     await configure_telegram()
-    try:
-        await recover_games_and_publish()
-    except Exception:
-        logger.exception("Startup legacy-game recovery failed.")
-    recovery_task = asyncio.create_task(recovery_loop(), name="legacy-game-recovery")
+    recovery_task = asyncio.create_task(recovery_loop(), name="world-recovery")
     try:
         yield
     finally:
         shutdown_event.set()
         if recovery_task:
-            try:
-                await recovery_task
-            except Exception:
-                logger.exception("Recovery task shutdown failed.")
-        try:
-            await telegram_application.stop()
-        finally:
-            try:
-                await telegram_application.shutdown()
-            finally:
-                await db.close()
+            await recovery_task
+        await telegram_application.stop()
+        await telegram_application.shutdown()
+        await db.close()
 
 
 app = FastAPI(
     title="YourOwnVision",
-    description="WHAT HAPPENS? continuous Telegram Mini App world.",
-    version="2.0.0",
+    description="Lightweight continuous-world Telegram Mini App.",
+    version="3.0.0",
     lifespan=lifespan,
 )
 app.include_router(miniapp_router)
 mount_static(app)
 
-# The Mini App is now the primary /play path. Negative handler groups have
-# higher priority than the legacy bot handlers without requiring a risky rewrite.
-telegram_application.add_handler(
-    MessageHandler(
-        filters.ChatType.PRIVATE & filters.Regex(r"^/start(?:@\w+)?\s+(?:world_|invite_).+"),
-        world_start,
-    ),
-    group=-2,
-)
-telegram_application.add_handler(
-    CommandHandler("play", world_play),
-    group=-2,
-)
-
 
 @app.get("/health", response_class=JSONResponse)
 async def health() -> dict[str, Any]:
-    return {"status": "ok", "service": "YourOwnVision", "environment": CONFIG.environment}
+    return {"status": "ok", "service": "YourOwnVision", "version": "3.0.0"}
 
 
 @app.post(CONFIG.telegram_webhook_path, response_class=JSONResponse)
@@ -181,11 +118,7 @@ async def telegram_webhook(
         raise HTTPException(status_code=400, detail="Invalid Telegram update.") from exc
     if update is None:
         raise HTTPException(status_code=400, detail="Invalid Telegram update.")
-    try:
-        await process_update(telegram_application, update)
-    except Exception as exc:
-        logger.exception("Telegram update processing failed: %s", update.update_id)
-        raise HTTPException(status_code=500, detail="Update processing failed.") from exc
+    await telegram_application.process_update(update)
     return {"ok": True}
 
 
@@ -201,7 +134,7 @@ async def telegram_status() -> dict[str, Any]:
     }
 
 
-@app.get("/", response_class=JSONResponse)
+@app.get("/")
 async def root() -> dict[str, Any]:
     return {"service": "YourOwnVision", "status": "running", "miniapp": "/app", "health": "/health"}
 
