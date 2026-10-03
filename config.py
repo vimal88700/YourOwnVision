@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -32,6 +33,7 @@ class Config:
     environment: str
     log_level: str
     mini_app_short_name: str
+    bot_creator_id: int
 
 
 CONFIG = Config(
@@ -46,6 +48,7 @@ CONFIG = Config(
     environment=optional("ENVIRONMENT", "production"),
     log_level=optional("LOG_LEVEL", "INFO"),
     mini_app_short_name=optional("MINI_APP_SHORT_NAME", "what_happens"),
+    bot_creator_id=int(os.getenv("BOT_CREATOR_ID", "0")),
 )
 
 if not CONFIG.public_base_url.startswith(("http://", "https://")):

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import Any
@@ -13,7 +12,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from config import CONFIG
 from database import Database
 from miniapp_api import configure_service, mount_static, router as miniapp_router
-from world_bot import world_play, world_start
+from world_bot import maintenance_command, pause_world, resume_world, terminate_world, world_play, world_start
 from world_service import WorldService
 
 logging.basicConfig(
@@ -26,14 +25,11 @@ db = Database(CONFIG.supabase_url, CONFIG.supabase_service_key)
 world_service = WorldService(db)
 configure_service(db)
 telegram_application = Application.builder().token(CONFIG.telegram_token).build()
-shutdown_event = asyncio.Event()
-recovery_task: asyncio.Task[None] | None = None
 
 
 def webhook_url() -> str:
-    base = CONFIG.public_base_url.rstrip("/")
     path = CONFIG.telegram_webhook_path
-    return f"{base}{path if path.startswith('/') else '/' + path}"
+    return f"{CONFIG.public_base_url.rstrip('/')}{path if path.startswith('/') else '/' + path}"
 
 
 async def configure_telegram() -> None:
@@ -45,45 +41,34 @@ async def configure_telegram() -> None:
     )
 
 
-async def recovery_loop() -> None:
-    while not shutdown_event.is_set():
-        try:
-            await world_service.activate_due_worlds()
-        except Exception:
-            logger.exception("World recovery tick failed")
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=15)
-        except asyncio.TimeoutError:
-            pass
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global recovery_task
-    shutdown_event.clear()
     telegram_application.bot_data["db"] = db
     telegram_application.bot_data["world_service"] = world_service
+
     telegram_application.add_handler(
         MessageHandler(
-            filters.ChatType.PRIVATE & filters.Regex(r"^/start(?:@\w+)?\s+(?:world_|invite_).+"),
+            filters.ChatType.PRIVATE & filters.Regex(r"^/start(?:@\w+)?\s+(?:invite_|w_).+"),
             world_start,
         ),
-        group=-10,
+        group=-20,
     )
     telegram_application.add_handler(CommandHandler("play", world_play), group=-10)
+    telegram_application.add_handler(CommandHandler("pause", pause_world), group=-10)
+    telegram_application.add_handler(CommandHandler("resume", resume_world), group=-10)
+    telegram_application.add_handler(CommandHandler(["endworld", "terminateworld"], terminate_world), group=-10)
+    telegram_application.add_handler(CommandHandler("maintenance", maintenance_command), group=-10)
+
     await telegram_application.initialize()
     await telegram_application.start()
     me = await telegram_application.bot.get_me()
     app.state.bot_username = me.username or ""
     app.state.telegram_bot = telegram_application.bot
     await configure_telegram()
-    recovery_task = asyncio.create_task(recovery_loop(), name="world-recovery")
+    logger.info("YourOwnVision started as @%s", me.username)
     try:
         yield
     finally:
-        shutdown_event.set()
-        if recovery_task:
-            await recovery_task
         await telegram_application.stop()
         await telegram_application.shutdown()
         await db.close()
@@ -91,8 +76,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="YourOwnVision",
-    description="Lightweight continuous-world Telegram Mini App.",
-    version="3.0.0",
+    description="WHAT HAPPENS? — continuous multiplayer Telegram Mini App",
+    version="4.0.0",
     lifespan=lifespan,
 )
 app.include_router(miniapp_router)
@@ -101,7 +86,7 @@ mount_static(app)
 
 @app.get("/health", response_class=JSONResponse)
 async def health() -> dict[str, Any]:
-    return {"status": "ok", "service": "YourOwnVision", "version": "3.0.0"}
+    return {"status": "ok", "service": "YourOwnVision", "version": "4.0.0"}
 
 
 @app.post(CONFIG.telegram_webhook_path, response_class=JSONResponse)

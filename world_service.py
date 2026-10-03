@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -7,9 +8,8 @@ from typing import Any
 
 from database import Database, DatabaseConflict, DatabaseError
 
-# Small deterministic content library. No per-click AI call, no asset download,
-# and no server-side story object kept in RAM. The world seed + player state
-# produce the next situation deterministically.
+# Procedural content is intentionally compact. A single seed creates a huge
+# number of combinations without storing generated stories or calling Gemini.
 DIMENSIONS = [
     ("ordinary", "The Living City"),
     ("coast", "The Salt Coast"),
@@ -19,6 +19,10 @@ DIMENSIONS = [
     ("digital", "The Glass Network"),
     ("frontier", "The Far Frontier"),
     ("wild", "The Wild Country"),
+    ("sky", "The High Expanse"),
+    ("archive", "The Memory Vault"),
+    ("deep", "The Deep Roads"),
+    ("horizon", "The Last Horizon"),
 ]
 
 LOCATIONS = [
@@ -27,7 +31,7 @@ LOCATIONS = [
     ("rooftops", "North Rooftops", "ordinary"),
     ("harbor", "Night Harbor", "coast"),
     ("lighthouse", "The Broken Lighthouse", "coast"),
-    ("tunnels", "The Service Tunnels", "underworld"),
+    ("tunnels", "Service Tunnels", "underworld"),
     ("archive", "The Buried Archive", "underworld"),
     ("mirror_square", "Mirror Square", "mirror"),
     ("glass_house", "The Glass House", "mirror"),
@@ -36,6 +40,14 @@ LOCATIONS = [
     ("orchard", "The Silent Orchard", "wild"),
     ("relay", "Relay Nine", "digital"),
     ("server_garden", "The Server Garden", "digital"),
+    ("sky_dock", "Sky Dock Seven", "sky"),
+    ("observatory", "The Empty Observatory", "sky"),
+    ("memory_hall", "Memory Hall", "archive"),
+    ("sealed_library", "The Sealed Library", "archive"),
+    ("deep_bridge", "The Deep Bridge", "deep"),
+    ("black_well", "The Black Well", "deep"),
+    ("horizon_gate", "Horizon Gate", "horizon"),
+    ("last_town", "The Last Town", "horizon"),
 ]
 
 NPCS = [
@@ -49,6 +61,8 @@ NPCS = [
     ("cass", "Cass Rowan", "charismatic drifter"),
     ("ivy", "Ivy Mercer", "doctor who asks dangerous questions"),
     ("ren", "Ren Sol", "traveler who knows the shortcuts"),
+    ("vale", "Vale Mercer", "quiet negotiator"),
+    ("theo", "Theo March", "friendly smuggler"),
 ]
 
 SITUATIONS = [
@@ -71,23 +85,49 @@ SITUATIONS = [
     ("Someone claims they remember a life you never lived", "identity"),
     ("A harmless promise quietly changes the rules around you", "consequence"),
     ("A hidden settlement offers you a place to belong", "community"),
-    ("You discover that another player has changed this place", "multiplayer"),
+    ("Another player has clearly changed this place", "multiplayer"),
+    ("A stranger offers you a map with one location missing", "exploration"),
+    ("A valuable item is being auctioned to people who should not exist", "faction"),
+    ("A friend asks whether you remember a different version of them", "relationship"),
+    ("A local festival turns into a negotiation for control of the district", "politics"),
+    ("Someone offers to erase one mistake from your past", "sacrifice"),
+    ("A machine predicts a choice you have not made yet", "technology"),
+    ("You find a room containing objects from your possible futures", "dream"),
+    ("A road appears behind you after you swear not to return", "exploration"),
+    ("A faction claims your last choice changed their history", "consequence"),
+    ("A wounded rival asks you for one honest answer", "relationship"),
+    ("A market stall sells memories instead of goods", "wonder"),
+    ("The sky briefly shows another dimension", "dimension"),
+    ("A quiet stranger knows the name of someone you lost", "mystery"),
+    ("A settlement asks you to choose who gets its final resource", "community"),
+    ("Someone has been leaving gifts at your checkpoint", "relationship"),
+    ("A dangerous shortcut promises to save days of travel", "risk"),
+    ("The world offers you a position of influence", "politics"),
+    ("A sealed elevator opens to a place that should be impossible", "dimension"),
+    ("Two players arrive carrying different versions of the same object", "multiplayer"),
 ]
 
-
 OPENERS = [
-    "The first thing you notice is that nobody is acting surprised.",
+    "Nobody looks surprised, which is the first warning sign.",
     "You arrive a moment before the important part begins.",
-    "Something about the silence feels deliberate.",
-    "A small detail refuses to fit the version of events you were given.",
+    "The silence feels deliberate.",
+    "One detail refuses to fit the story you were given.",
     "For once, the safest-looking option is also the strangest.",
-    "You have the uncomfortable feeling that this moment has happened before.",
+    "You have the uncomfortable feeling that this moment happened before.",
     "Someone nearby is pretending not to watch you.",
     "The world seems ordinary until one impossible detail catches your eye.",
-    "A choice is already waiting for you before anyone says there is a choice.",
-    "You can feel several possible futures narrowing around this moment.",
+    "A choice is already waiting before anyone admits there is a choice.",
+    "Several possible futures seem to narrow around this moment.",
     "The local story sounds simple. The evidence does not.",
-    "Nobody asks you to get involved. That is exactly why you should worry.",
+    "Nobody asks you to get involved. That is exactly why you worry.",
+    "The room feels familiar for a reason you cannot remember.",
+    "You notice the exit first, then realize there are two more.",
+    "A stranger smiles as if you have already agreed.",
+    "The next minute feels more important than the last year.",
+    "Someone has prepared this place for a visitor. You are not sure it was you.",
+    "A harmless sound repeats until it becomes a pattern.",
+    "The world gives you one quiet second to decide who you want to be.",
+    "You can leave. That is what makes staying tempting.",
 ]
 
 TWISTS = [
@@ -97,35 +137,50 @@ TWISTS = [
     "Someone offers help without asking for anything in return.",
     "The safest explanation turns out to be the least useful one.",
     "A distant sound makes everyone pause at the same time.",
-    "One of the objects here seems to remember being somewhere else.",
-    "The boundary between this place and another world flickers for a heartbeat.",
+    "One object seems to remember being somewhere else.",
+    "The boundary between places flickers for a heartbeat.",
     "A stranger quietly uses your name even though you never introduced yourself.",
     "A promise made here may matter much later.",
     "You spot another player's influence in the aftermath of an earlier decision.",
     "There is a route forward, but it costs you something you may want later.",
+    "Someone notices your hesitation and changes their offer.",
+    "A door closes somewhere far away, and the whole district reacts.",
+    "You realize someone has been protecting you without asking permission.",
+    "The obvious villain may be the only person telling the truth.",
+    "A relationship shifts because of something you did several scenes ago.",
+    "The world remembers a promise you thought was private.",
+    "A new route appears only because another player chose differently.",
+    "The consequences are larger than the decision looked.",
 ]
 
 CHOICES = [
-    ("Approach carefully", {"courage": 1, "risk": 1}, "You step closer without revealing what you know."),
-    ("Listen before acting", {"insight": 1, "trust": 1}, "You wait long enough to hear the detail everyone else missed."),
+    ("Approach carefully", {"courage": 1, "risk": 1}, "You move closer without revealing what you know."),
+    ("Listen before acting", {"insight": 1, "trust": 1}, "You wait long enough to hear what others missed."),
     ("Take the opportunity", {"luck": 1, "risk": 2}, "You gamble on the opening before it disappears."),
     ("Protect the person involved", {"empathy": 1, "trust": 2}, "You put another person's safety ahead of your advantage."),
     ("Walk away and observe", {"insight": 2, "risk": -1}, "You give the situation room to reveal itself."),
     ("Tell the truth", {"honesty": 2, "trust": 1}, "You say the part that would have been easier to hide."),
     ("Keep the secret", {"cunning": 1, "trust": -1}, "You keep the information close and accept the cost."),
-    ("Make a deal", {"cunning": 1, "luck": 1}, "You trade something useful for a chance to move forward."),
+    ("Make a deal", {"cunning": 1, "luck": 1, "risk": 1}, "You trade something useful for a chance to move forward."),
     ("Search for another route", {"insight": 1, "luck": 1}, "You refuse the obvious path and look for a third option."),
     ("Trust your instinct", {"courage": 1, "empathy": 1, "risk": 1}, "You act before certainty arrives."),
     ("Ask for help", {"empathy": 1, "trust": 2}, "You let someone else become part of the decision."),
     ("Break the rule", {"courage": 2, "risk": 3}, "You deliberately cross a line that was supposed to stay untouched."),
+    ("Offer a compromise", {"honesty": 1, "trust": 2, "risk": -1}, "You try to keep both sides in the room."),
+    ("Investigate quietly", {"insight": 2, "cunning": 1}, "You gather information before choosing a side."),
+    ("Commit publicly", {"courage": 2, "trust": 1, "risk": 2}, "You make your position impossible to misunderstand."),
+    ("Protect your secret", {"cunning": 2, "trust": -2}, "You keep control of information even if someone is hurt by it."),
+    ("Follow the impossible path", {"luck": 2, "risk": 2}, "You choose the route that should not exist."),
+    ("Stay with them", {"empathy": 2, "trust": 2, "risk": 1}, "You refuse to leave someone alone with the consequences."),
 ]
 
-CONVERGENCE_EVERY = 5
+CONVERGENCE_EVERY = 7
 
 
 class WorldService:
     def __init__(self, db: Database):
         self.db = db
+        self._locks: dict[str, asyncio.Lock] = {}
 
     @staticmethod
     def now() -> datetime:
@@ -137,24 +192,22 @@ class WorldService:
 
     @staticmethod
     def h(*parts: Any) -> int:
-        raw = "|".join(map(str, parts)).encode("utf-8")
-        return int.from_bytes(hashlib.sha256(raw).digest()[:8], "big")
+        return int.from_bytes(hashlib.sha256("|".join(map(str, parts)).encode()).digest()[:8], "big")
 
     @classmethod
     def pick(cls, values: list[Any], key: int) -> Any:
         return values[key % len(values)]
 
     @classmethod
-    def dimension_name(cls, key: str) -> str:
-        return next((name for ident, name in DIMENSIONS if ident == key), "The Unknown")
+    def dimension_name(cls, ident: str) -> str:
+        return next((name for key, name in DIMENSIONS if key == ident), "The Unknown")
 
     @classmethod
-    def location(cls, location_id: str) -> tuple[str, str, str]:
-        return next((item for item in LOCATIONS if item[0] == location_id), LOCATIONS[0])
+    def location(cls, ident: str) -> tuple[str, str, str]:
+        return next((item for item in LOCATIONS if item[0] == ident), LOCATIONS[0])
 
     @classmethod
     def initial_player_state(cls, user_id: int) -> dict[str, Any]:
-        # Deliberately compact. We do not keep a transcript or dead character history.
         return {
             "status": "alive",
             "lives": 3,
@@ -178,48 +231,26 @@ class WorldService:
         loc = cls.pick(LOCATIONS, seed)
         return {
             "seed": seed,
-            "global_events": 0,
-            "convergence": 0,
+            "global_turn": 0,
             "arc": 0,
             "threat": 0,
+            "convergence": 0,
+            "convergence_active": False,
+            "convergence_actions": 0,
             "location_id": loc[0],
             "location_name": loc[1],
             "dimension": loc[2],
             "dimension_name": cls.dimension_name(loc[2]),
             "weather": cls.pick(["clear", "rain", "wind", "fog", "heat", "quiet", "electric"], seed // 7),
-            "flags": {},
             "discovered_dimensions": [loc[2]],
             "discovered_locations": [loc[0]],
-            "used_situations": [],
-            "used_npcs": [],
+            "used_scenes": [],
+            "flags": {},
             "shared_node": "intro",
         }
 
-    async def create_world(self, creator_id: int, chat_id: int | None = None, title: str | None = None) -> dict[str, Any]:
-        seed = secrets.randbits(62)
-        deadline = self.now() + timedelta(seconds=45)
-        clean_title = (title or "WHAT HAPPENS?").strip()[:80] or "WHAT HAPPENS?"
-        rows = await self.db.request(
-            "POST", "world_games", params={"select": "*"},
-            json={
-                "creator_id": creator_id,
-                "chat_id": chat_id,
-                "title": clean_title,
-                "status": "waiting",
-                "join_deadline": self.iso(deadline),
-                "seed": seed,
-                "world_state": self.initial_world_state(seed),
-                "settings": {"allow_external_invites": True},
-                "last_event": {"type": "world_created"},
-                "version": 1,
-                "max_players": 20,
-            },
-            prefer="return=representation",
-        )
-        if not rows:
-            raise DatabaseError("Could not create world.")
-        await self.event(rows[0]["id"], creator_id, "world_created", {"title": clean_title})
-        return rows[0]
+    def _lock(self, game_id: str) -> asyncio.Lock:
+        return self._locks.setdefault(game_id, asyncio.Lock())
 
     async def get_world(self, game_id: str) -> dict[str, Any]:
         rows = await self.db.request("GET", "world_games", params={"id": f"eq.{game_id}", "limit": "1"})
@@ -228,357 +259,408 @@ class WorldService:
         return rows[0]
 
     async def get_group_world(self, chat_id: int) -> dict[str, Any] | None:
-        rows = await self.db.request(
-            "GET", "world_games",
-            params={"chat_id": f"eq.{chat_id}", "status": "in.(waiting,active)", "order": "created_at.desc", "limit": "1"},
-        )
-        if not rows:
-            return None
-        game = rows[0]
-        # If a world was left unused in the lobby, reuse it instead of creating another row.
-        if game["status"] == "waiting" and game.get("join_deadline"):
-            deadline = datetime.fromisoformat(str(game["join_deadline"]).replace("Z", "+00:00"))
-            if self.now() >= deadline and not await self.players(game["id"]):
-                new_deadline = self.now() + timedelta(seconds=45)
-                updated = await self.db.request(
-                    "PATCH", "world_games", params={"id": f"eq.{game['id']}", "status": "eq.waiting"},
-                    json={"join_deadline": self.iso(new_deadline), "last_event": {"type": "lobby_reopened"}, "version": int(game.get("version") or 1) + 1},
-                    prefer="return=representation",
-                )
-                if updated:
-                    game = updated[0]
-        return game
+        rows = await self.db.request("GET", "world_games", params={
+            "chat_id": f"eq.{chat_id}",
+            "status": "in.(waiting,active,paused)",
+            "order": "created_at.desc",
+            "limit": "1",
+        })
+        return rows[0] if rows else None
 
     async def get_player(self, game_id: str, user_id: int) -> dict[str, Any] | None:
-        rows = await self.db.request("GET", "world_players", params={"game_id": f"eq.{game_id}", "telegram_user_id": f"eq.{user_id}", "limit": "1"})
+        rows = await self.db.request("GET", "world_players", params={
+            "game_id": f"eq.{game_id}",
+            "telegram_user_id": f"eq.{user_id}",
+            "limit": "1",
+        })
         return rows[0] if rows else None
 
     async def players(self, game_id: str) -> list[dict[str, Any]]:
-        return await self.db.request("GET", "world_players", params={"game_id": f"eq.{game_id}", "order": "joined_at.asc"})
+        return await self.db.request("GET", "world_players", params={
+            "game_id": f"eq.{game_id}",
+            "order": "joined_at.asc",
+            "limit": "50",
+        })
+
+    async def create_world(self, creator_id: int, chat_id: int | None, title: str | None = None) -> dict[str, Any]:
+        if chat_id is not None:
+            existing = await self.get_group_world(chat_id)
+            if existing:
+                return existing
+        seed = secrets.randbits(62)
+        deadline = self.now() + timedelta(seconds=45)
+        clean_title = (title or "WHAT HAPPENS?").strip()[:80] or "WHAT HAPPENS?"
+        rows = await self.db.request("POST", "world_games", params={"select": "*"}, json={
+            "creator_id": creator_id,
+            "chat_id": chat_id,
+            "title": clean_title,
+            "status": "waiting",
+            "join_deadline": self.iso(deadline),
+            "started_at": None,
+            "seed": seed,
+            "world_state": self.initial_world_state(seed),
+            "settings": {
+                "allow_external_invites": True,
+                "operator_ids": [],
+                "max_players": 20,
+            },
+            "last_event": {"type": "world_created"},
+            "version": 1,
+            "max_players": 20,
+        }, prefer="return=representation")
+        if not rows:
+            raise DatabaseError("Could not create world.")
+        return rows[0]
+
+    async def ensure_world_for_group(self, chat_id: int, creator_id: int) -> dict[str, Any]:
+        # The partial unique index protects the final race. If two /play commands
+        # arrive together, the second request simply re-reads the existing world.
+        existing = await self.get_group_world(chat_id)
+        if existing:
+            return existing
+        try:
+            return await self.create_world(creator_id, chat_id)
+        except Exception:
+            existing = await self.get_group_world(chat_id)
+            if existing:
+                return existing
+            raise
+
+    async def ensure_active(self, game: dict[str, Any]) -> dict[str, Any]:
+        if game.get("status") != "waiting":
+            return game
+        players = await self.players(str(game["id"]))
+        if not players:
+            # Keep the world forever. A future /play reopens the 45-second lobby.
+            deadline = game.get("join_deadline")
+            if deadline:
+                dt = datetime.fromisoformat(str(deadline).replace("Z", "+00:00"))
+                if self.now() >= dt:
+                    rows = await self.db.request("PATCH", "world_games", params={"id": f"eq.{game['id']}", "status": "eq.waiting"}, json={
+                        "join_deadline": self.iso(self.now() + timedelta(seconds=45)),
+                        "version": int(game.get("version") or 1) + 1,
+                        "last_event": {"type": "lobby_reopened"},
+                    }, prefer="return=representation")
+                    return rows[0] if rows else await self.get_world(str(game["id"]))
+            return game
+        deadline = game.get("join_deadline")
+        if not deadline:
+            return game
+        dt = datetime.fromisoformat(str(deadline).replace("Z", "+00:00"))
+        if self.now() < dt:
+            return game
+        rows = await self.db.request("PATCH", "world_games", params={"id": f"eq.{game['id']}", "status": "eq.waiting"}, json={
+            "status": "active",
+            "started_at": game.get("started_at") or self.iso(self.now()),
+            "version": int(game.get("version") or 1) + 1,
+            "last_event": {"type": "world_started"},
+        }, prefer="return=representation")
+        return rows[0] if rows else await self.get_world(str(game["id"]))
 
     async def join(self, game_id: str, user_id: int, username: str, display_name: str) -> dict[str, Any]:
-        game = await self.get_world(game_id)
-        if game["status"] not in ("waiting", "active"):
-            raise ValueError("This world is no longer accepting players.")
-
-        if game["status"] == "waiting" and game.get("join_deadline"):
-            deadline = datetime.fromisoformat(str(game["join_deadline"]).replace("Z", "+00:00"))
-            if self.now() >= deadline:
-                existing = await self.players(game_id)
-                if existing:
-                    game = await self.start(game_id)
-                else:
-                    # Reuse this unstarted world rather than throwing it away.
-                    await self.db.request(
-                        "PATCH", "world_games",
-                        params={"id": f"eq.{game_id}", "status": "eq.waiting"},
-                        json={"join_deadline": self.iso(self.now() + timedelta(seconds=45)), "version": int(game.get("version") or 1) + 1},
-                        prefer="return=minimal",
-                    )
-
+        game = await self.ensure_active(await self.get_world(game_id))
+        if game.get("status") == "paused":
+            raise ValueError("This world is paused by its game moderators.")
+        if game.get("status") == "archived":
+            raise ValueError("This world has ended.")
         existing = await self.get_player(game_id, user_id)
         if existing:
             return existing
-
-        rows = await self.db.rpc("join_world_atomic", {
+        result = await self.db.rpc("join_world_atomic", {
             "p_game_id": game_id,
             "p_user_id": user_id,
             "p_username": username or "",
             "p_display_name": display_name or "Player",
         })
-        if not rows:
-            raise DatabaseConflict("Could not join this world.")
-        player = rows[0] if isinstance(rows, list) else rows
-        await self.event(game_id, user_id, "player_joined", {"display_name": display_name or "Player"})
-        return player
+        if isinstance(result, list):
+            return result[0]
+        return result
 
-    async def start(self, game_id: str) -> dict[str, Any]:
-        game = await self.get_world(game_id)
-        if game["status"] == "active":
-            return game
-        if game["status"] != "waiting":
-            return game
-        if not await self.players(game_id):
-            raise ValueError("No players have joined yet.")
-        rows = await self.db.request(
-            "PATCH", "world_games",
-            params={"id": f"eq.{game_id}", "status": "eq.waiting"},
-            json={"status": "active", "started_at": self.iso(self.now()), "version": int(game.get("version") or 1) + 1, "last_event": {"type": "world_started"}},
-            prefer="return=representation",
-        )
-        return rows[0] if rows else await self.get_world(game_id)
-
-    async def activate_due_worlds(self) -> list[str]:
-        try:
-            result = await self.db.rpc("activate_due_worlds", {})
-            # RPC returns integer in JSON form.
-        except Exception:
-            return []
-        if not result:
-            return []
-        rows = await self.db.request("GET", "world_games", params={"status": "eq.active", "order": "started_at.desc", "limit": "50"})
-        return [str(row["id"]) for row in rows]
-
-    async def create_invite(self, game_id: str, user_id: int) -> str:
-        token = secrets.token_urlsafe(12).replace("-", "_")[:24]
-        await self.db.request(
-            "POST", "world_invites", params={"select": "*"},
-            json={"token": token, "game_id": game_id, "created_by": user_id, "uses": 0, "max_uses": 100, "active": True},
-            prefer="return=representation",
-        )
-        return token
-
-    async def consume_invite(self, token: str, user_id: int, username: str, name: str) -> dict[str, Any]:
-        rows = await self.db.request("GET", "world_invites", params={"token": f"eq.{token}", "active": "eq.true", "limit": "1"})
-        if not rows:
-            raise ValueError("Invite link is invalid or expired.")
-        invite = rows[0]
-        if int(invite["uses"]) >= int(invite["max_uses"]):
-            raise ValueError("This invite has reached its limit.")
-        player = await self.join(str(invite["game_id"]), user_id, username, name)
-        await self.db.request("PATCH", "world_invites", params={"token": f"eq.{token}"}, json={"uses": int(invite["uses"]) + 1})
-        return {"game": await self.get_world(str(invite["game_id"])), "player": player}
-
-    @classmethod
-    def _next_location(cls, seed: int, key: int, current_dimension: str | None = None) -> tuple[str, str, str]:
+    def _next_location(self, seed: int, key: int, current_dimension: str | None) -> tuple[str, str, str]:
+        # Usually move to a different dimension. Occasionally stay put for continuity.
         candidates = [x for x in LOCATIONS if x[2] != current_dimension] or LOCATIONS
-        return cls.pick(candidates, key)
+        return self.pick(candidates, key)
 
-    @classmethod
-    def _scene_for(cls, game: dict[str, Any], player: dict[str, Any]) -> dict[str, Any]:
-        world = dict(game.get("world_state") or {})
-        state = dict(player.get("state") or {})
+    def _scene_for(self, game: dict[str, Any], player: dict[str, Any]) -> dict[str, Any]:
+        world = game.get("world_state") or {}
+        state = player.get("state") or {}
         seed = int(world.get("seed") or game.get("seed") or 1)
-        turns = int(state.get("turns") or 0)
+        turn = int(state.get("turns") or 0)
         cycle = int(state.get("cycle") or 0)
         uid = int(player["telegram_user_id"])
         shared_node = str(world.get("shared_node") or "intro")
-        loc = cls.location(str(world.get("location_id") or "market"))
-        npc = cls.pick(NPCS, cls.h(seed, turns, cycle, "npc", shared_node, loc[0]))
-        situation = cls.pick(SITUATIONS, cls.h(seed, turns, cycle, uid, "situation", shared_node, loc[0]))
-        used = set(world.get("used_situations") or [])
-        # Avoid repeating the exact situation key until the compact bank has been exhausted.
-        if f"{situation[0]}:{loc[0]}:{cycle}" in used:
-            for offset in range(1, len(SITUATIONS)):
-                candidate = SITUATIONS[(cls.h(seed, turns, cycle, uid, "situation2", shared_node, loc[0]) + offset) % len(SITUATIONS)]
-                key = f"{candidate[0]}:{loc[0]}:{cycle}"
-                if key not in used:
-                    situation = candidate
-                    break
-        bond = int((state.get("relationships") or {}).get(npc[0], 0))
-        convergence = turns > 0 and turns % CONVERGENCE_EVERY == 0
-        if convergence:
-            title = "The place where paths meet"
+        loc = self.location(str(world.get("location_id") or "market"))
+
+        # During a convergence, everyone sees the same scene and choices.
+        if world.get("convergence_active"):
+            npc = self.pick(NPCS, self.h(seed, world.get("convergence", 0), "conv-npc"))
+            title = f"{loc[1]} — The Meeting Point"
             text = (
-                f"Everyone's separate path bends toward {loc[1]}. "
-                f"{npc[1]} is there too, watching the group arrive from different directions. "
-                "For a moment, the world feels shared rather than personal."
+                f"Paths that began separately arrive at {loc[1]}. {npc[1]}, {npc[2]}, "
+                "is waiting beside a table covered in objects that different players remember differently. "
+                "For a moment, every choice belongs to everyone."
             )
             category = "convergence"
+            base = self.h(seed, world.get("convergence", 0), "convergence-choices")
         else:
+            npc = self.pick(NPCS, self.h(seed, turn, cycle, uid, "npc", shared_node, loc[0]))
+            situation = self.pick(SITUATIONS, self.h(seed, turn, cycle, uid, "situation", shared_node, loc[0]))
+            used = set(world.get("used_scenes") or [])
+            key = f"{cycle}:{turn}:{loc[0]}:{situation[0]}"
+            if key in used:
+                for offset in range(1, len(SITUATIONS)):
+                    candidate = SITUATIONS[(self.h(seed, turn, cycle, uid, "alt") + offset) % len(SITUATIONS)]
+                    candidate_key = f"{cycle}:{turn}:{loc[0]}:{candidate[0]}"
+                    if candidate_key not in used:
+                        situation = candidate
+                        key = candidate_key
+                        break
+            opener = self.pick(OPENERS, self.h(seed, turn, cycle, uid, "opener", loc[0]))
+            twist = self.pick(TWISTS, self.h(seed, turn, cycle, uid, "twist", loc[0]))
+            bond = int((state.get("relationships") or {}).get(npc[0], 0))
+            text = f"{opener} In {loc[1]}, {situation[0].lower()}. {npc[1]} is nearby, a {npc[2]}. {twist}"
+            if bond >= 4:
+                text += f" {npc[1]} trusts you enough to wait for your answer."
+            elif bond <= -4:
+                text += f" {npc[1]} watches you as if expecting betrayal."
             title = f"{loc[1]} — {situation[0]}"
-            opener = cls.pick(OPENERS, cls.h(seed, turns, cycle, uid, "opener", loc[0], situation[1]))
-            twist = cls.pick(TWISTS, cls.h(seed, turns, cycle, uid, "twist", loc[0], situation[1]))
-            text = (
-                f"{opener} In {loc[1]}, {situation[0].lower()}. "
-                f"{npc[1]} is nearby, a {npc[2]}. "
-                f"The air feels {world.get('weather','quiet')}, and the boundary of "
-                f"{cls.dimension_name(loc[2])} feels unusually thin. {twist}"
-            )
-            if bond >= 3:
-                text += f" {npc[1]} clearly trusts you more than before."
-            elif bond <= -3:
-                text += f" {npc[1]} keeps a careful distance from you."
-        base = cls.h(seed, turns, cycle, uid, shared_node, loc[0], situation[1])
-        choices = []
+            category = situation[1]
+            base = self.h(seed, turn, cycle, uid, shared_node, loc[0], situation[1])
+
+        choices: list[dict[str, Any]] = []
         for i in range(3):
-            label, effects, consequence = CHOICES[(base + i * 3) % len(CHOICES)]
-            risk = ((base >> (i * 7)) % 5) - 1
+            label, effects, consequence = CHOICES[(base + i * 5) % len(CHOICES)]
             choices.append({
-                "id": f"c{i+1}",
+                "id": f"c{i + 1}",
                 "label": label,
                 "preview": consequence,
-                "risk": int(risk),
+                "risk": max(-1, min(4, int(effects.get("risk", 0)))),
                 "effects": effects,
                 "npc_id": npc[0],
             })
-        scene_id = f"{world.get('arc',0)}:{cycle}:{turn}:{shared_node}:{loc[0]}:{situation[1]}"
+        scene_id = f"{world.get('arc', 0)}:{cycle}:{turn}:{shared_node}:{loc[0]}:{category}:{base % 10000}"
         return {
             "id": scene_id,
             "title": title,
             "text": text,
             "category": category,
             "location": loc[1],
-            "dimension": cls.dimension_name(loc[2]),
-            "npc": {"id": npc[0], "name": npc[1], "bond": bond},
-            "convergence": convergence,
+            "dimension": self.dimension_name(loc[2]),
+            "npc": {"id": npc[0], "name": npc[1], "bond": int((state.get("relationships") or {}).get(npc[0], 0))},
+            "convergence": bool(world.get("convergence_active")),
             "choices": choices,
         }
 
-    def present(self, game: dict[str, Any], player: dict[str, Any] | None, players: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    def present(self, game: dict[str, Any], player: dict[str, Any] | None, roster: list[dict[str, Any]]) -> dict[str, Any]:
         world = game.get("world_state") or {}
         state = (player or {}).get("state") or {}
-        roster = players or []
         return {
             "game": {
-                "id": game["id"],
-                "title": game["title"],
-                "status": game["status"],
+                "id": str(game["id"]),
+                "title": game.get("title") or "WHAT HAPPENS?",
+                "status": game.get("status"),
                 "version": int(game.get("version") or 1),
                 "max_players": int(game.get("max_players") or 20),
                 "join_deadline": game.get("join_deadline"),
                 "started_at": game.get("started_at"),
                 "chat_id": game.get("chat_id"),
-                "settings": game.get("settings") or {"allow_external_invites": True},
+                "creator_id": game.get("creator_id"),
+                "settings": game.get("settings") or {"allow_external_invites": True, "operator_ids": []},
             },
             "player": None if not player else {
-                "id": player["id"],
-                "display_name": player["display_name"],
-                "username": player.get("username", ""),
-                "status": player.get("status", "alive"),
+                "id": str(player["id"]),
+                "display_name": player.get("display_name") or "Player",
+                "username": player.get("username") or "",
+                "status": player.get("status") or "alive",
+                "version": int(player.get("version") or 1),
                 "state": state,
             },
             "players": [
-                {"id": p["id"], "display_name": p["display_name"], "username": p.get("username", ""), "status": p.get("status", "alive"), "joined_at": p.get("joined_at")}
+                {"id": str(p["id"]), "display_name": p.get("display_name") or "Player", "username": p.get("username") or "", "status": p.get("status") or "alive", "joined_at": p.get("joined_at")}
                 for p in roster
             ],
             "world": {
-                "location": world.get("location_name"),
-                "dimension": world.get("dimension_name"),
-                "turn": int(state.get("turns") or 0),
-                "global_events": int(world.get("global_events") or 0),
+                "location": world.get("location_name") or "Unknown",
+                "dimension": world.get("dimension_name") or "The Unknown",
+                "turn": int(world.get("global_turn") or 0),
                 "convergence": int(world.get("convergence") or 0),
+                "convergence_active": bool(world.get("convergence_active")),
                 "threat": int(world.get("threat") or 0),
                 "discoveries": list(world.get("discovered_dimensions") or [])[-8:],
+                "locations": list(world.get("discovered_locations") or [])[-8:],
             },
-            "scene": self._scene_for(game, player) if player and game["status"] == "active" and state.get("status") == "alive" else None,
+            "scene": self._scene_for(game, player) if player and game.get("status") == "active" and state.get("status") == "alive" else None,
         }
 
-    async def snapshot(self, game_id: str, user_id: int, include_unjoined: bool = False) -> dict[str, Any]:
-        game = await self.get_world(game_id)
+    async def snapshot(self, game_id: str, user_id: int, include_unjoined: bool = True) -> dict[str, Any]:
+        game = await self.ensure_active(await self.get_world(game_id))
         player = await self.get_player(game_id, user_id)
         if not player and not include_unjoined:
             raise ValueError("Join this world first.")
         return self.present(game, player, await self.players(game_id))
 
-    async def choose(self, game_id: str, user_id: int, choice_id: str, expected_version: int) -> dict[str, Any]:
-        game = await self.get_world(game_id)
-        if game["status"] == "waiting":
-            game = await self.start(game_id)
-        if game["status"] != "active":
-            raise ValueError("This world is not active.")
-        player = await self.get_player(game_id, user_id)
-        if not player:
-            raise ValueError("Join this world first.")
-        if player.get("status") != "alive":
-            raise ValueError("This character is currently out of the world. Re-enter from the world menu.")
-        version = int(game.get("version") or 1)
-        # A multiplayer click by another player must not invalidate this player's
-        # choice. Refresh the shared world version and recompute the same scene.
-        if int(expected_version) != version:
-            game = await self.get_world(game_id)
-            version = int(game.get("version") or 1)
-            player = await self.get_player(game_id, user_id) or player
+    async def choose(self, game_id: str, user_id: int, choice_id: str) -> dict[str, Any]:
+        lock = self._lock(game_id)
+        async with lock:
+            game = await self.ensure_active(await self.get_world(game_id))
+            if game.get("status") != "active":
+                raise ValueError("This world is not currently accepting story choices.")
+            player = await self.get_player(game_id, user_id)
+            if not player:
+                raise ValueError("Join the world first.")
+            state = dict(player.get("state") or {})
+            if state.get("status") != "alive":
+                raise ValueError("Your current run has ended. Re-enter the world to begin a new path.")
+            scene = self._scene_for(game, player)
+            choice = next((c for c in scene["choices"] if c["id"] == choice_id), None)
+            if not choice:
+                raise ValueError("That choice is no longer available. Refreshing the story will give you the current choice.")
 
-        scene = self._scene_for(game, player)
-        choice = next((c for c in scene["choices"] if c["id"] == choice_id), None)
-        if not choice:
-            raise ValueError("That choice is no longer available.")
+            world = dict(game.get("world_state") or {})
+            stats = dict(state.get("stats") or {})
+            for key, value in choice["effects"].items():
+                if key in stats:
+                    stats[key] = int(stats.get(key, 0)) + int(value)
+            state["stats"] = stats
+            state["turns"] = int(state.get("turns") or 0) + 1
+            state["energy"] = max(0, int(state.get("energy", 100)) - 3)
+            state["health"] = max(0, min(100, int(state.get("health", 100)) + (3 if choice["effects"].get("empathy") else 0)))
+            rel = dict(state.get("relationships") or {})
+            npc_id = str(choice.get("npc_id") or "")
+            if npc_id:
+                rel[npc_id] = int(rel.get(npc_id, 0)) + int(choice["effects"].get("trust", 0))
+            state["relationships"] = rel
+            state["last_choice"] = choice_id
+            state.setdefault("path", {})["chapter"] = int(state["turns"]) // 6
+            state["path"]["branch"] = self.h(game["seed"], user_id, state["turns"], choice_id) % 64
+            state["path"]["node"] = f"{world.get('arc', 0)}:{state['path']['branch']}"
 
-        world = dict(game.get("world_state") or {})
-        state = dict(player.get("state") or {})
-        stats = dict(state.get("stats") or {})
-        for key, value in choice["effects"].items():
-            if key in stats:
-                stats[key] = int(stats.get(key, 0)) + int(value)
-        state["stats"] = stats
-        state["turns"] = int(state.get("turns") or 0) + 1
-        state["energy"] = max(0, int(state.get("energy", 100)) - 4)
-        state["health"] = max(0, min(100, int(state.get("health", 100)) + (2 if "Protect" in choice["label"] else 0)))
-        rel = dict(state.get("relationships") or {})
-        rel[choice["npc_id"]] = int(rel.get(choice["npc_id"], 0)) + int(choice["effects"].get("trust", 0))
-        state["relationships"] = rel
-        state["last_choice"] = choice_id
-        state.setdefault("path", {})["chapter"] = int(state.get("turns", 0)) // 5
-        state["path"]["branch"] = self.h(game["seed"], user_id, state["turns"], choice_id) % 12
+            world["global_turn"] = int(world.get("global_turn") or 0) + 1
+            world["arc"] = int(world.get("arc") or 0) + 1
+            world["threat"] = max(0, min(12, int(world.get("threat") or 0) + int(choice["effects"].get("risk", 0))))
+            used = list(world.get("used_scenes") or [])
+            used.append(scene["id"])
+            world["used_scenes"] = used[-120:]
 
-        world["global_events"] = int(world.get("global_events") or 0) + 1
-        world["arc"] = int(world.get("arc") or 0) + 1
-        world["threat"] = max(0, min(10, int(world.get("threat") or 0) + int(choice.get("risk") or 0)))
-        situation_key = f"{scene['id']}:{choice_id}"
-        used = list(world.get("used_situations") or [])
-        if situation_key not in used:
-            used.append(situation_key)
-        world["used_situations"] = used[-80:]
+            convergence_started = False
+            if not world.get("convergence_active") and int(world["global_turn"]) % CONVERGENCE_EVERY == 0:
+                world["convergence"] = int(world.get("convergence") or 0) + 1
+                world["convergence_active"] = True
+                world["convergence_actions"] = 0
+                world["shared_node"] = f"convergence_{world['convergence']}"
+                loc = self._next_location(int(game["seed"]), self.h(game["seed"], world["convergence"], "convergence"), world.get("dimension"))
+                world["location_id"], world["location_name"], world["dimension"] = loc
+                world["dimension_name"] = self.dimension_name(loc[2])
+                if loc[2] not in world.get("discovered_dimensions", []):
+                    world.setdefault("discovered_dimensions", []).append(loc[2])
+                if loc[0] not in world.get("discovered_locations", []):
+                    world.setdefault("discovered_locations", []).append(loc[0])
+                convergence_started = True
 
-        # Every few actions the shared world creates a convergence point.
-        if state["turns"] % CONVERGENCE_EVERY == 0:
-            world["convergence"] = int(world.get("convergence") or 0) + 1
-            world["shared_node"] = f"convergence_{world['convergence']}"
-            loc = self._next_location(int(game["seed"]), self.h(game["seed"], world["convergence"], user_id), world.get("dimension"))
-            world["location_id"], world["location_name"], world["dimension"] = loc
-            world["dimension_name"] = self.dimension_name(loc[2])
-            if loc[2] not in (world.get("discovered_dimensions") or []):
-                world.setdefault("discovered_dimensions", []).append(loc[2])
-            if loc[0] not in (world.get("discovered_locations") or []):
-                world.setdefault("discovered_locations", []).append(loc[0])
+            if world.get("convergence_active"):
+                world["convergence_actions"] = int(world.get("convergence_actions") or 0) + 1
+                alive_count = max(1, len([p for p in await self.players(game_id) if p.get("status") == "alive"]))
+                if int(world["convergence_actions"]) >= min(3, max(2, alive_count)):
+                    world["convergence_active"] = False
+                    world["shared_node"] = f"branch_{world['global_turn']}"
 
-        # Death is meaningful but never ends the shared world. The old path is discarded.
-        danger = int(world.get("threat") or 0)
-        died = int(self.h(game["seed"], user_id, state["turns"], choice_id, "death")) % 100 < min(5 + max(0, danger) * 2, 24) and int(choice.get("risk") or 0) > 0
-        event: dict[str, Any] = {
-            "type": "choice",
-            "user_id": str(user_id),
-            "choice_id": choice_id,
-            "scene_id": scene["id"],
-            "died": died,
-            "turn": state["turns"],
-        }
-        if died:
-            # Once a run dies we deliberately do not retain its old path, inventory,
-            # relationships or scene transcript. Only the minimal death marker remains.
-            state["deaths"] = int(state.get("deaths") or 0) + 1
-            state["lives"] = int(state.get("lives") or 3) - 1
-            if state["lives"] <= 0:
-                state["cycle"] = int(state.get("cycle") or 0) + 1
-                state["lives"] = 3
-                state["flags"] = {"last_run_lost": True}
-            # Do not keep the dead run's inventory/relationship/path transcript.
-            respawn = self._next_location(int(game["seed"]), self.h(game["seed"], user_id, state["deaths"], state["cycle"], "respawn"), world.get("dimension"))
-            state = {
-                **self.initial_player_state(user_id),
-                "deaths": int(state.get("deaths") or 0),
-                "cycle": int(state.get("cycle") or 0),
-                "lives": int(state.get("lives") or 3),
-                "flags": {"last_run_lost": True},
-                "checkpoint": {"location_id": respawn[0], "dimension": respawn[2]},
-            }
-            world["location_id"], world["location_name"], world["dimension"] = respawn
-            world["dimension_name"] = self.dimension_name(respawn[2])
-            event = {
-                "type": "death",
+            danger = int(world.get("threat") or 0)
+            risk = int(choice["effects"].get("risk", 0))
+            death_chance = min(28, max(0, 4 + danger * 2 + risk * 3))
+            died = risk > 0 and self.h(game["seed"], user_id, state["turns"], choice_id, "death") % 100 < death_chance
+            event: dict[str, Any] = {
+                "type": "choice",
                 "user_id": str(user_id),
-                "deaths": int(state.get("deaths") or 0),
-                "lives": int(state.get("lives") or 3),
-                "cycle": int(state.get("cycle") or 0),
+                "choice_id": choice_id,
+                "scene_id": scene["id"],
+                "turn": state["turns"],
+                "convergence": bool(convergence_started),
+                "died": bool(died),
             }
 
-        result = await self.db.rpc("commit_world_turn", {
-            "p_game_id": game_id,
-            "p_player_id": player["id"],
-            "p_expected_game_version": version,
-            "p_expected_player_updated_at": player["updated_at"],
-            "p_world_state": world,
-            "p_player_state": state,
-            "p_event": event,
-        })
-        if not result:
-            raise DatabaseConflict("The world changed. Please try again.")
-        return {"snapshot": await self.snapshot(game_id, user_id), "event": event}
+            if died:
+                deaths = int(state.get("deaths") or 0) + 1
+                lives = int(state.get("lives") or 3) - 1
+                cycle = int(state.get("cycle") or 0)
+                if lives <= 0:
+                    cycle += 1
+                    lives = 3
+                respawn = self._next_location(int(game["seed"]), self.h(game["seed"], user_id, deaths, cycle, "respawn"), world.get("dimension"))
+                # Do not preserve the dead run. Only compact survival metadata survives.
+                state = self.initial_player_state(user_id)
+                state.update({
+                    "deaths": deaths,
+                    "cycle": cycle,
+                    "lives": lives,
+                    "flags": {"last_run_lost": True},
+                    "checkpoint": {"location_id": respawn[0], "dimension": respawn[2]},
+                })
+                world["location_id"], world["location_name"], world["dimension"] = respawn
+                world["dimension_name"] = self.dimension_name(respawn[2])
+                event.update({"type": "death", "deaths": deaths, "lives": lives, "cycle": cycle, "respawn": {"location": respawn[1], "dimension": self.dimension_name(respawn[2])}})
 
-    async def event(self, game_id: str, user_id: int | None, event_type: str, payload: dict[str, Any]) -> None:
-        await self.db.request(
-            "POST", "world_events",
-            json={"game_id": game_id, "actor_user_id": user_id, "event_type": event_type, "payload": payload},
-            prefer="return=minimal",
-        )
+            result = await self.db.rpc("commit_world_turn", {
+                "p_game_id": game_id,
+                "p_player_id": player["id"],
+                "p_expected_game_version": int(game.get("version") or 1),
+                "p_expected_player_version": int(player.get("version") or 1),
+                "p_world_state": world,
+                "p_player_state": state,
+                "p_event": event,
+            })
+            if not result:
+                raise DatabaseConflict("The world changed. Please try again.")
+            return {"snapshot": await self.snapshot(game_id, user_id), "event": event}
+
+    async def create_invite(self, game_id: str, user_id: int) -> str:
+        token = secrets.token_urlsafe(12).replace("-", "_").replace("=", "")[:24]
+        rows = await self.db.request("POST", "world_invites", params={"select": "token"}, json={
+            "token": token, "game_id": game_id, "created_by": user_id, "uses": 0, "max_uses": 100, "active": True,
+        }, prefer="return=representation")
+        return str(rows[0]["token"] if rows else token)
+
+    async def consume_invite(self, token: str, user_id: int, username: str, name: str) -> dict[str, Any]:
+        rows = await self.db.request("GET", "world_invites", params={"token": f"eq.{token}", "active": "eq.true", "limit": "1"})
+        if not rows:
+            raise ValueError("Invite link is invalid or expired.")
+        invite = rows[0]
+        if int(invite.get("uses") or 0) >= int(invite.get("max_uses") or 100):
+            raise ValueError("This invite has reached its limit.")
+        player = await self.join(str(invite["game_id"]), user_id, username, name)
+        await self.db.request("PATCH", "world_invites", params={"token": f"eq.{token}"}, json={"uses": int(invite.get("uses") or 0) + 1}, prefer="return=minimal")
+        return {"game": await self.get_world(str(invite["game_id"])), "player": player}
+
+    async def update_settings(self, game_id: str, values: dict[str, Any]) -> dict[str, Any]:
+        rows = await self.db.request("PATCH", "world_games", params={"id": f"eq.{game_id}"}, json=values, prefer="return=representation")
+        if not rows:
+            raise ValueError("World not found.")
+        return rows[0]
+
+    async def pause(self, game_id: str, actor_id: int) -> dict[str, Any]:
+        return await self.update_settings(game_id, {"status": "paused", "last_event": {"type": "paused", "actor": actor_id}})
+
+    async def resume(self, game_id: str, actor_id: int) -> dict[str, Any]:
+        return await self.update_settings(game_id, {"status": "active", "last_event": {"type": "resumed", "actor": actor_id}})
+
+    async def terminate(self, game_id: str, actor_id: int) -> dict[str, Any]:
+        return await self.update_settings(game_id, {"status": "archived", "last_event": {"type": "terminated", "actor": actor_id}})
+
+    async def set_operators(self, game_id: str, operator_ids: list[int]) -> dict[str, Any]:
+        game = await self.get_world(game_id)
+        settings = dict(game.get("settings") or {})
+        settings["operator_ids"] = sorted({int(x) for x in operator_ids})[:10]
+        return await self.update_settings(game_id, {"settings": settings})
+
+    async def maintenance(self) -> dict[str, Any] | None:
+        rows = await self.db.request("GET", "world_control", params={"id": "eq.1", "limit": "1"})
+        return rows[0] if rows else None
+
+    async def maintenance_active(self) -> bool:
+        row = await self.maintenance()
+        if not row or not row.get("maintenance_until"):
+            return False
+        try:
+            until = datetime.fromisoformat(str(row["maintenance_until"]).replace("Z", "+00:00"))
+            return self.now() < until
+        except Exception:
+            return False

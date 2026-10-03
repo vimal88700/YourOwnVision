@@ -20,6 +20,8 @@ services:
         sync: false
       - key: MINI_APP_SHORT_NAME
         value: what_happens
+      - key: BOT_CREATOR_ID
+        sync: false
       - key: ENVIRONMENT
         value: production
       - key: LOG_LEVEL
