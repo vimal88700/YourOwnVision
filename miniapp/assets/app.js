@@ -3,164 +3,157 @@
   tg?.ready();
   tg?.expand();
   tg?.disableVerticalSwipes?.();
-  tg?.setHeaderColor?.('#080b12');
-  tg?.setBackgroundColor?.('#080b12');
+  tg?.setHeaderColor?.('#070a11');
+  tg?.setBackgroundColor?.('#070a11');
 
-  const $ = (id) => document.getElementById(id);
-  const qs = new URLSearchParams(location.search);
+  const $ = id => document.getElementById(id);
   const initData = tg?.initData || '';
+  const qs = new URLSearchParams(location.search);
   let startParam = tg?.initDataUnsafe?.start_param || qs.get('startapp') || qs.get('tgWebAppStartParam') || '';
   let snapshot = null;
-  let isAdmin = false;
+  let permissions = {};
   let busy = false;
-  let lobbyTimer = null;
-  let syncTimer = null;
   let soundOn = true;
+  let pollTimer = null;
+  let lobbyDeadline = 0;
+  let currentTab = 'story';
 
-  const api = async (path, options = {}) => {
+  const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+
+  async function api(path, options = {}) {
     const headers = {
       'Content-Type': 'application/json',
       'X-Telegram-Init-Data': initData,
       'X-MiniApp-Start-Param': startParam,
       ...(options.headers || {})
     };
-    const response = await fetch(path, { ...options, headers, cache: 'no-store' });
+    const res = await fetch(path, { ...options, headers, cache: 'no-store' });
     let data = {};
-    try { data = await response.json(); } catch (_) {}
-    if (!response.ok) throw new Error(data.detail || 'Request failed');
+    try { data = await res.json(); } catch (_) {}
+    if (!res.ok) throw new Error(data.detail || 'Request failed');
     return data;
-  };
+  }
 
-  const esc = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
-
-  function tone(freq = 540, duration = 0.045) {
-    if (!soundOn || !window.AudioContext && !window.webkitAudioContext) return;
+  function haptic(type = 'light') { try { tg?.HapticFeedback?.impactOccurred(type); } catch (_) {} }
+  function tone(freq = 520, duration = .045) {
+    if (!soundOn) return;
     try {
       const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
       const ctx = tone.ctx || (tone.ctx = new Ctx());
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.frequency.value = freq;
-      osc.type = 'sine';
-      gain.gain.setValueAtTime(0.035, ctx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + duration);
+      const osc = ctx.createOscillator(), gain = ctx.createGain();
+      osc.type = 'sine'; osc.frequency.value = freq;
+      gain.gain.setValueAtTime(.028, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(.0001, ctx.currentTime + duration);
       osc.connect(gain); gain.connect(ctx.destination);
       osc.start(); osc.stop(ctx.currentTime + duration);
     } catch (_) {}
   }
 
-  function haptic(type = 'light') {
-    try { tg?.HapticFeedback?.impactOccurred(type); } catch (_) {}
-  }
-
   function toast(text, kind = '') {
-    $('toast').textContent = text;
-    $('toast').className = `toast ${kind}`;
+    const node = $('toast');
+    node.textContent = text;
+    node.className = `toast ${kind}`;
     clearTimeout(toast.timer);
-    toast.timer = setTimeout(() => $('toast').classList.add('hidden'), 2600);
+    toast.timer = setTimeout(() => node.classList.add('hidden'), 2800);
   }
 
   function showOnly(id) {
-    ['statusCard','home','lobby','game'].forEach(x => $(x).classList.toggle('hidden', x !== id));
-    $('bottomNav').classList.toggle('hidden', id !== 'game');
+    ['statusCard','home','world'].forEach(x => $(x).classList.toggle('hidden', x !== id));
+    $('bottomNav').classList.toggle('hidden', id !== 'world');
   }
 
-  function renderRoster(players) {
-    const html = players.length ? players.map((p, i) => `
+  function initials(name) { return String(name || 'P').trim().slice(0, 1).toUpperCase(); }
+
+  function rosterHTML(players) {
+    if (!players?.length) return '<div class="empty-state">Waiting for the first player…</div>';
+    return players.map(p => `
       <div class="roster-row">
-        <div class="avatar">${esc((p.display_name || 'P').slice(0,1).toUpperCase())}</div>
-        <div class="roster-name"><b>${esc(p.display_name || 'Player')}</b><small>${p.status === 'alive' ? (i === 0 ? 'Joined' : 'In the world') : 'Returning soon'}</small></div>
-        <span class="online-dot"></span>
-      </div>`).join('') : `<div class="empty-state">Waiting for the first player…</div>`;
-    $('lobbyPlayers').innerHTML = html;
-    $('playerCount').textContent = players.length;
+        <div class="avatar">${esc(initials(p.display_name))}</div>
+        <div class="roster-name"><b>${esc(p.display_name || 'Player')}</b><small>${p.status === 'alive' ? 'In the world' : 'Run ended — may return'}</small></div>
+        <span class="live-dot"></span>
+      </div>`).join('');
   }
 
   function renderLobby(data) {
     snapshot = data;
-    const g = data.game || {};
-    const me = data.player;
-    showOnly('lobby');
-    $('lobbyTitle').textContent = g.title || 'WHAT HAPPENS?';
-    renderRoster(data.players || []);
-    const joined = !!me;
-    $('joinBtn').textContent = joined ? '✓ YOU ARE IN — OPEN STORY' : 'JOIN WORLD';
-    $('joinBtn').classList.toggle('joined', joined);
-    $('joinBtn').disabled = busy;
-    $('lobbyStatus').textContent = g.status === 'active' ? 'WORLD LIVE' : 'JOINING';
-    $('lobbyStatus').className = `status-pill ${g.status === 'active' ? 'live' : 'waiting'}`;
-    $('lobbyHint').textContent = joined
-      ? 'You are already in this world. Your next action continues your own path.'
-      : 'One click joins you. Clicking again never creates a duplicate player.';
-    const deadline = g.join_deadline ? new Date(g.join_deadline).getTime() : Date.now();
-    clearInterval(lobbyTimer);
-    const tick = () => {
-      const left = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
-      $('lobbyTimer').textContent = left;
-      if (left === 0 && g.status === 'waiting') {
-        clearInterval(lobbyTimer);
-        sync();
-      }
-    };
-    tick();
-    if (g.status === 'waiting') lobbyTimer = setInterval(tick, 1000);
+    const g = data.game;
+    showOnly('world');
+    $('worldTitle').textContent = g.title || 'WHAT HAPPENS?';
+    $('dimension').textContent = data.world?.dimension || 'The Unknown';
+    $('location').textContent = data.world?.location || 'Waiting…';
+    $('worldStatus').textContent = 'JOINING';
+    $('worldStatus').className = 'status-pill waiting';
+    $('lobbyPanel').classList.remove('hidden');
+    $('storyPanel').classList.add('hidden');
+    $('pausedPanel').classList.add('hidden');
+    $('lobbyPlayers').innerHTML = rosterHTML(data.players || []);
+    $('playerCount').textContent = String((data.players || []).length);
+    lobbyDeadline = g.join_deadline ? new Date(g.join_deadline).getTime() : Date.now();
+    renderPermissions();
+    tickLobby();
   }
 
-  async function joinWorld() {
-    if (!snapshot?.game?.id || busy) return;
-    if (snapshot.player) { renderGame(snapshot); return; }
-    busy = true; tone(620); haptic('light'); $('joinBtn').disabled = true;
-    try {
-      const r = await api('/api/miniapp/join', { method:'POST', body: JSON.stringify({ game_id: snapshot.game.id }) });
-      snapshot = r.snapshot;
-      toast('You joined the world.', 'good');
-      renderGame(snapshot);
-    } catch (e) {
-      toast(e.message, 'bad');
-      await sync();
-    } finally { busy = false; }
+  function tickLobby() {
+    if (!snapshot?.game || snapshot.game.status !== 'waiting') return;
+    const left = Math.max(0, Math.ceil((lobbyDeadline - Date.now()) / 1000));
+    $('lobbyTimer').textContent = String(left);
+    if (left === 0) sync(false);
+  }
+
+  function renderPermissions() {
+    const g = snapshot?.game || {};
+    $('settingsPanel').classList.toggle('hidden', !(permissions.is_admin || permissions.can_terminate || permissions.can_moderate));
+    $('settingsNav').classList.toggle('hidden', !(permissions.is_admin || permissions.can_terminate || permissions.can_moderate));
+    $('toggleInvites').disabled = !permissions.is_admin;
+    $('pauseBtn').disabled = !permissions.can_moderate;
+    $('resumeBtn').disabled = !permissions.can_moderate;
+    $('terminateWrap').classList.toggle('hidden', !permissions.can_terminate);
+    $('operatorWrap').classList.toggle('hidden', !permissions.can_manage_operators);
+    $('inviteSetting').textContent = g.settings?.allow_external_invites === false ? 'OFF' : 'ON';
   }
 
   function renderGame(data) {
     snapshot = data;
-    if (data.game?.id) startParam = `game_${data.game.id}`;
+    if (data.game?.id) startParam = `w_${data.game.id}`;
     const g = data.game || {};
     const p = data.player?.state || {};
     const s = data.scene;
-    showOnly('game');
+    showOnly('world');
     $('worldTitle').textContent = g.title || 'WHAT HAPPENS?';
     $('dimension').textContent = data.world?.dimension || 'The Unknown';
     $('location').textContent = data.world?.location || 'Somewhere';
+    $('worldStatus').textContent = g.status === 'paused' ? 'PAUSED' : 'LIVE';
+    $('worldStatus').className = `status-pill ${g.status === 'paused' ? 'waiting' : 'live'}`;
+    $('lobbyPanel').classList.toggle('hidden', g.status !== 'waiting');
+    $('pausedPanel').classList.toggle('hidden', g.status !== 'paused');
+    $('storyPanel').classList.toggle('hidden', g.status !== 'active');
     $('lifeText').textContent = p.lives ?? 3;
     $('health').textContent = p.health ?? 100;
     $('energy').textContent = p.energy ?? 100;
-    $('cycle').textContent = p.cycle ?? 0;
+    $('worldTurn').textContent = data.world?.turn ?? 0;
     $('healthBar').style.width = `${Math.max(0, Math.min(100, Number(p.health ?? 100)))}%`;
-    $('relationships').innerHTML = Object.entries(p.relationships || {}).filter(([,v]) => Number(v) !== 0).slice(0,6).map(([id,v]) => `<span class="chip">${esc(id)} ${Number(v)>0?'+':''}${v}</span>`).join('');
-    $('discoveries').innerHTML = (data.world?.discoveries || []).map(x => `<span class="chip dim">${esc(x)}</span>`).join('');
-    const roster = data.players || [];
-    $('gamePlayers').innerHTML = roster.length ? roster.map(p => `<div class="roster-row"><div class="avatar">${esc((p.display_name || 'P').slice(0,1).toUpperCase())}</div><div class="roster-name"><b>${esc(p.display_name || 'Player')}</b><small>${p.status === 'alive' ? 'In the world' : 'Returning soon'}</small></div><span class="online-dot"></span></div>`).join('') : `<div class="empty-state">No players yet.</div>`;
-    $('settingsPanel').classList.toggle('hidden', !isAdmin);
-    $('settingsNav').classList.toggle('hidden', !isAdmin);
-    $('inviteSetting').textContent = (g.settings?.allow_external_invites ?? true) ? 'ON' : 'OFF';
 
-    if (!s) {
-      $('choices').innerHTML = `<div class="panel empty-state">Your character is between paths. Reopen the world to continue.</div>`;
-      return;
-    }
-    $('sceneCategory').textContent = (s.category || 'story').toUpperCase();
+    const players = data.players || [];
+    $('peopleList').innerHTML = rosterHTML(players);
+    $('peopleCount').textContent = String(players.length);
+    $('relationships').innerHTML = Object.entries(p.relationships || {}).filter(([,v]) => Number(v) !== 0).slice(0, 8).map(([id,v]) => `<span class="chip">${esc(id)} ${Number(v) > 0 ? '+' : ''}${v}</span>`).join('') || '<span class="muted">Your relationships will appear here.</span>';
+    $('discoveries').innerHTML = (data.world?.discoveries || []).map(x => `<span class="chip dim">${esc(x)}</span>`).join('') || '<span class="muted">You have not crossed another dimension yet.</span>';
+    renderPermissions();
+
+    if (!s || g.status !== 'active') return;
+    $('sceneCategory').textContent = String(s.category || 'story').toUpperCase();
     $('sceneConvergence').classList.toggle('hidden', !s.convergence);
-    $('sceneTitle').textContent = s.title;
-    $('sceneText').textContent = s.text;
-    $('npcLine').textContent = s.npc ? `${s.npc.name}  •  bond ${s.npc.bond}` : '';
-
+    $('sceneTitle').textContent = s.title || 'The next moment';
+    $('sceneText').textContent = s.text || '';
+    $('npcLine').textContent = s.npc ? `${s.npc.name}  •  relationship ${s.npc.bond}` : '';
     const choices = $('choices');
     choices.innerHTML = '';
     (s.choices || []).forEach((c, index) => {
       const b = document.createElement('button');
       b.className = 'choice-card';
       b.disabled = busy;
-      b.innerHTML = `<span class="choice-index">${index + 1}</span><span class="choice-copy"><b>${esc(c.label)}</b><small>${esc(c.preview || 'The world will remember this.')}</small></span><span class="choice-arrow">›</span>`;
+      b.innerHTML = `<span class="choice-index">${index + 1}</span><span class="choice-copy"><b>${esc(c.label)}</b><small>${esc(c.preview)}</small></span><span class="choice-arrow">›</span>`;
       b.onclick = () => choose(c.id);
       choices.appendChild(b);
     });
@@ -168,97 +161,135 @@
 
   async function choose(choiceId) {
     if (busy || !snapshot?.game?.id) return;
-    busy = true; tone(720); haptic('medium');
-    document.querySelectorAll('.choice-card').forEach(b => b.disabled = true);
-    document.querySelectorAll('.choice-card').forEach(b => b.classList.add('pressed'));
+    busy = true;
+    haptic('medium'); tone(690);
+    document.querySelectorAll('.choice-card').forEach(b => { b.disabled = true; b.classList.add('pressed'); });
     try {
-      const r = await api('/api/miniapp/choice', { method:'POST', body: JSON.stringify({ game_id: snapshot.game.id, choice_id: choiceId, expected_version: snapshot.game.version }) });
-      if (r.event?.died) {
-        tone(220, .12); haptic('heavy');
-        toast(r.event.respawn ? `💀 You fell. You wake in ${r.event.respawn.location}.` : '💀 You fell. The world continues.', 'bad');
-      } else if (r.event?.convergence) {
-        toast('◇ Everyone is being pulled toward a shared moment.', 'good');
-      } else {
-        toast('The world changed.', 'good');
+      const result = await api('/api/miniapp/choice', { method: 'POST', body: JSON.stringify({ game_id: snapshot.game.id, choice_id: choiceId }) });
+      if (result.event?.died) {
+        tone(210, .12); haptic('heavy');
+        toast(result.event.respawn ? `💀 Your run ended. You wake in ${result.event.respawn.location}. The world continues.` : '💀 Your run ended. The world continues.', 'bad');
+      } else if (result.event?.convergence) {
+        tone(820, .09); toast('◇ The world is pulling everyone toward a shared meeting point.', 'good');
       }
-      renderGame(r.snapshot);
+      renderGame(result.snapshot);
     } catch (e) {
       toast(e.message, 'bad');
-      await sync();
-    } finally { busy = false; }
+      await sync(false);
+    } finally {
+      busy = false;
+    }
   }
 
-  async function sync() {
+  async function sync(showLoading = true) {
+    if (showLoading && !snapshot) showOnly('statusCard');
     try {
       const data = await api('/api/miniapp/bootstrap');
-      isAdmin = !!data.is_admin;
+      permissions = {
+        is_admin: !!data.is_admin,
+        can_moderate: !!data.can_moderate,
+        can_terminate: !!data.can_terminate,
+        can_manage_operators: !!data.can_manage_operators,
+      };
+      if (data.maintenance?.active) {
+        showOnly('home');
+        $('homeTitle').textContent = 'Maintenance in progress';
+        $('home').querySelector('p').textContent = `The worlds are safe. Updates are being applied until ${new Date(data.maintenance.until).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}.`;
+        return;
+      }
       if (!data.game) return renderHome(data);
-      if (data.invite === 'joined' && data.game.game?.id) startParam = `game_${data.game.game.id}`;
       const g = data.game.game;
-      if (g.status === 'waiting' || !data.game.player) renderLobby(data.game);
-      else if (g.status === 'active') renderGame(data.game);
-      else renderHome(data);
+      if (g.status === 'waiting') renderLobby(data.game);
+      else renderGame(data.game);
     } catch (e) {
       showOnly('statusCard');
-      $('statusCard').innerHTML = `<div><strong>Could not enter the world.</strong><div class="muted">${esc(e.message)}</div></div>`;
+      $('statusCard').innerHTML = `<div><b>Could not enter the world.</b><span>${esc(e.message)}</span></div>`;
     }
   }
 
   function renderHome(data) {
     showOnly('home');
-    const first = data.user?.first_name ? ` ${esc(data.user.first_name)}` : '';
-    $('home').querySelector('h2').textContent = `Your choices change the world${first ? ',' + first : ''}.`;
+    const name = data.user?.first_name ? `, ${data.user.first_name}` : '';
+    $('homeTitle').textContent = `Open a world${name}.`;
   }
 
-  $('createWorld').onclick = async () => {
-    if (busy) return;
-    busy = true; tone(580); haptic('medium'); $('createWorld').disabled = true;
-    try {
-      const r = await api('/api/miniapp/worlds', { method:'POST', body:'{}' });
-      startParam = `game_${r.game.game.id}`;
-      snapshot = r.game;
-      renderLobby(r.game);
-      toast('World created. The lobby is open.', 'good');
-    } catch (e) { toast(e.message, 'bad'); }
-    finally { busy = false; $('createWorld').disabled = false; }
-  };
-
-  $('joinBtn').onclick = joinWorld;
-
-  $('inviteBtn').onclick = async () => {
-    if (!snapshot?.game?.id || !snapshot.player) { toast('Join the world first.', 'bad'); return; }
+  async function invite() {
+    if (!snapshot?.game?.id || !snapshot.player) return toast('Join the world first.', 'bad');
     try {
       const r = await api('/api/miniapp/invite', { method:'POST', body: JSON.stringify({ game_id: snapshot.game.id }) });
-      if (tg?.openTelegramLink) tg.openTelegramLink(r.link);
-      else if (navigator.share) await navigator.share({ title:'Join my WHAT HAPPENS? world', url:r.link });
-      else { await navigator.clipboard.writeText(r.link); toast('Invite link copied.', 'good'); }
+      if (navigator.share) await navigator.share({ title: 'Join my WHAT HAPPENS? world', url: r.link });
+      else if (navigator.clipboard) { await navigator.clipboard.writeText(r.link); toast('Invite link copied.', 'good'); }
+      else tg?.openTelegramLink?.(r.link);
     } catch (e) { toast(e.message, 'bad'); }
-  };
+  }
 
-  $('soundBtn').onclick = () => {
-    soundOn = !soundOn; $('soundBtn').textContent = soundOn ? '🔊' : '🔇'; if (soundOn) tone();
-  };
-
-  $('toggleInvites').onclick = async () => {
-    if (!snapshot?.game?.id || !isAdmin) return;
+  async function toggleInvites() {
+    if (!snapshot?.game?.id || !permissions.is_admin) return;
     try {
       const r = await api('/api/miniapp/settings/invites', { method:'POST', body: JSON.stringify({ game_id: snapshot.game.id }) });
-      snapshot.game.settings = r.settings;
-      $('inviteSetting').textContent = r.settings.allow_external_invites ? 'ON' : 'OFF';
-      toast(r.settings.allow_external_invites ? 'External invites enabled.' : 'External invites disabled.', 'good');
+      snapshot.game.settings = r.settings; renderPermissions(); toast(r.settings.allow_external_invites ? 'Outside invites enabled.' : 'Outside invites disabled.', 'good');
     } catch (e) { toast(e.message, 'bad'); }
-  };
+  }
 
-  document.querySelectorAll('.bottom-nav button').forEach(btn => btn.onclick = () => {
-    document.querySelectorAll('.bottom-nav button').forEach(x => x.classList.remove('active'));
-    btn.classList.add('active');
-    const tab = btn.dataset.tab;
-    if (tab === 'settings' && isAdmin) $('settingsPanel').scrollIntoView({ behavior:'smooth', block:'center' });
-    if (tab === 'people') $('gamePlayers').scrollIntoView({ behavior:'smooth', block:'center' });
-    if (tab === 'story') window.scrollTo({ top: 0, behavior: 'smooth' });
+  async function moderation(action) {
+    if (!snapshot?.game?.id || !permissions.can_moderate) return;
+    try {
+      await api(`/api/miniapp/moderation/${action}`, { method:'POST', body: JSON.stringify({ game_id: snapshot.game.id }) });
+      await sync(false); toast(action === 'pause' ? 'World paused.' : 'World resumed.', 'good');
+    } catch (e) { toast(e.message, 'bad'); }
+  }
+
+  async function terminate() {
+    if (!snapshot?.game?.id || !permissions.can_terminate) return;
+    if (!confirm('Archive this world? Current data remains stored, but this world will no longer accept play.')) return;
+    try {
+      await api('/api/miniapp/moderation/terminate', { method:'POST', body: JSON.stringify({ game_id: snapshot.game.id }) });
+      toast('World archived.', 'good');
+      await sync(false);
+    } catch (e) { toast(e.message, 'bad'); }
+  }
+
+  async function operator(action) {
+    const id = Number($('operatorId').value.trim());
+    if (!id || !snapshot?.game?.id || !permissions.can_manage_operators) return toast('Enter a valid Telegram user ID.', 'bad');
+    try {
+      await api('/api/miniapp/settings/operators', { method:'POST', body: JSON.stringify({ game_id: snapshot.game.id, user_id: id, action }) });
+      toast(action === 'add' ? 'Operator assigned.' : 'Operator removed.', 'good');
+      $('operatorId').value = '';
+    } catch (e) { toast(e.message, 'bad'); }
+  }
+
+  $('soundBtn').onclick = () => { soundOn = !soundOn; $('soundBtn').textContent = soundOn ? '◉' : '○'; if (soundOn) tone(); };
+  $('inviteBtn').onclick = invite;
+  $('toggleInvites').onclick = toggleInvites;
+  $('pauseBtn').onclick = () => moderation('pause');
+  $('resumeBtn').onclick = () => moderation('resume');
+  $('terminateBtn').onclick = terminate;
+  $('operatorAdd').onclick = () => operator('add');
+  $('operatorRemove').onclick = () => operator('remove');
+
+  document.querySelectorAll('.bottom-nav button').forEach(btn => {
+    btn.onclick = () => {
+      document.querySelectorAll('.bottom-nav button').forEach(x => x.classList.remove('active'));
+      btn.classList.add('active');
+      currentTab = btn.dataset.tab;
+      $('storyPanel').classList.toggle('hidden', currentTab !== 'story' || snapshot?.game?.status !== 'active');
+      $('peoplePanel').classList.toggle('hidden', currentTab !== 'people');
+      $('settingsPanel').classList.toggle('hidden', currentTab !== 'settings' || !(permissions.is_admin || permissions.can_terminate || permissions.can_moderate));
+      if (currentTab === 'story') window.scrollTo({ top: 0, behavior: 'smooth' });
+    };
   });
 
-  // Fast, light sync: lobby needs roster updates; live story only refreshes after a choice.
-  syncTimer = setInterval(() => { if (!busy && snapshot?.game?.status === 'waiting') sync(); }, 2200);
-  sync();
+  function startPolling() {
+    clearInterval(pollTimer);
+    pollTimer = setInterval(() => {
+      if (document.hidden || busy) return;
+      if (snapshot?.game?.status === 'waiting' || snapshot?.game?.status === 'active' || snapshot?.game?.status === 'paused') sync(false);
+    }, 4500);
+  }
+
+  setInterval(tickLobby, 1000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) sync(false); });
+  startPolling();
+  sync(true);
 })();
