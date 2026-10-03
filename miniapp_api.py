@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 
 from config import CONFIG
 from database import DatabaseConflict, DatabaseError
-from world_bot import publish_world_card
+from world_bot import main_app_url, publish_world_card
 from world_service import WorldService
 
 router = APIRouter(prefix="/api/miniapp", tags=["miniapp"])
@@ -50,7 +50,7 @@ def service() -> WorldService:
 
 def validate_init_data(init_data: str) -> dict[str, Any]:
     if not init_data:
-        raise HTTPException(status_code=401, detail="Open this Mini App from Telegram.")
+        raise HTTPException(status_code=401, detail="Open the Mini App from Telegram.")
 
     pairs = dict(parse_qsl(init_data, keep_blank_values=True))
     supplied_hash = pairs.pop("hash", "")
@@ -72,38 +72,23 @@ def validate_init_data(init_data: str) -> dict[str, Any]:
     ).hexdigest()
 
     if not hmac.compare_digest(calculated, supplied_hash):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid Telegram session signature.",
-        )
+        raise HTTPException(status_code=401, detail="Invalid Telegram session signature.")
 
     try:
         auth_date = int(pairs.get("auth_date", "0") or 0)
     except ValueError as exc:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid Telegram session.",
-        ) from exc
+        raise HTTPException(status_code=401, detail="Invalid Telegram session.") from exc
 
     if auth_date <= 0 or int(time.time()) - auth_date > 86400:
-        raise HTTPException(
-            status_code=401,
-            detail="Telegram session expired. Reopen the Mini App.",
-        )
+        raise HTTPException(status_code=401, detail="Telegram session expired. Reopen the Mini App.")
 
     try:
         user = json.loads(pairs.get("user", "{}"))
     except json.JSONDecodeError as exc:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid Telegram user payload.",
-        ) from exc
+        raise HTTPException(status_code=401, detail="Invalid Telegram user payload.") from exc
 
     if not user.get("id"):
-        raise HTTPException(
-            status_code=401,
-            detail="Telegram user is missing.",
-        )
+        raise HTTPException(status_code=401, detail="Telegram user is missing.")
 
     chat = None
     if pairs.get("chat"):
@@ -126,49 +111,36 @@ async def auth_user(
     x_miniapp_start_param: str | None = None,
 ):
     data = validate_init_data(x_telegram_init_data or "")
-    start = str(
-        x_miniapp_start_param
-        or data.get("start_param")
-        or ""
-    )
+    start = str(x_miniapp_start_param or data.get("start_param") or "")
     return data["user"], start, data.get("chat")
 
 
 def app_deep_link(request: Request, start_param: str = "") -> str:
+    # Main Mini App direct links are valid in groups and preserve chat context.
     bot_username = getattr(request.app.state, "bot_username", "")
-    short_name = str(getattr(CONFIG, "mini_app_short_name", "") or "").strip()
-    if bot_username and short_name:
-        suffix = f"?startapp={start_param}" if start_param else ""
-        return f"https://t.me/{bot_username}/{short_name}{suffix}"
-
     if bot_username:
-        suffix = f"?startapp={start_param}" if start_param else "?startapp"
-        return f"https://t.me/{bot_username}{suffix}"
-
-    base = str(request.base_url).rstrip("/") + "/app"
-    return f"{base}?startapp={start_param}" if start_param else base
+        return main_app_url(bot_username, start_param)
+    return f"{str(request.base_url).rstrip('/')}/app?startapp={start_param}"
 
 
-async def maintenance_response() -> dict[str, Any] | None:
-    row = await service().maintenance()
-    if not row or not row.get("maintenance_until"):
+def _until(value: Any) -> datetime | None:
+    if not value:
         return None
-
     try:
-        until = datetime.fromisoformat(
-            str(row["maintenance_until"]).replace("Z", "+00:00")
-        )
-        if datetime.now(timezone.utc) >= until:
-            return None
-        return {"active": True, "until": until.isoformat()}
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except Exception:
         return None
 
 
-async def resolve_game(
-    start_param: str,
-    chat: dict[str, Any] | None,
-):
+async def maintenance_response() -> dict[str, Any] | None:
+    row = await service().maintenance()
+    until = _until(row.get("maintenance_until") if row else None)
+    if not until or datetime.now(timezone.utc) >= until:
+        return None
+    return {"active": True, "until": until.isoformat()}
+
+
+async def resolve_game(start_param: str, chat: dict[str, Any] | None):
     svc = service()
 
     if start_param.startswith("w_"):
@@ -182,11 +154,7 @@ async def resolve_game(
         rows = await svc.db.request(
             "GET",
             "world_invites",
-            params={
-                "token": f"eq.{token}",
-                "active": "eq.true",
-                "limit": "1",
-            },
+            params={"token": f"eq.{token}", "active": "eq.true", "limit": "1"},
         )
         if rows:
             try:
@@ -194,6 +162,8 @@ async def resolve_game(
             except Exception:
                 return None
 
+    # Some Telegram launch modes include the chat object. This is only a fallback;
+    # group launch links always carry the game id in startapp.
     if chat and chat.get("id"):
         return await svc.get_group_world(int(chat["id"]))
 
@@ -210,7 +180,6 @@ async def can_group_admin(
 
     bot = getattr(request.app.state, "telegram_bot", None)
     chat_id = game.get("chat_id")
-
     if not bot or not chat_id:
         return False
 
@@ -230,16 +199,18 @@ async def can_moderate(
         return True
 
     settings = game.get("settings") or {}
-    if user_id in [int(x) for x in settings.get("operator_ids", [])]:
+    try:
+        operators = {int(x) for x in settings.get("operator_ids", [])}
+    except Exception:
+        operators = set()
+
+    if user_id in operators:
         return True
 
     return await can_group_admin(request, game, user_id)
 
 
-async def refresh_group_card(
-    request: Request,
-    game: dict[str, Any],
-) -> None:
+async def refresh_group_card(request: Request, game: dict[str, Any]) -> None:
     bot = getattr(request.app.state, "telegram_bot", None)
     if not bot or not game.get("chat_id"):
         return
@@ -252,7 +223,7 @@ async def refresh_group_card(
             service().db,
         )
     except Exception:
-        # A deleted Telegram card must never break the Mini App.
+        # Telegram UI failures must never break the actual game API.
         pass
 
 
@@ -303,6 +274,7 @@ async def bootstrap(
     if not game:
         return result
 
+    # /play already creates the world. Opening the Mini App never creates a new one.
     game = await svc.ensure_active(game)
 
     try:
@@ -312,26 +284,19 @@ async def bootstrap(
             str(user.get("username") or ""),
             str(user.get("first_name") or "Player"),
         )
-    except ValueError:
-        pass
+    except ValueError as exc:
+        # A paused world should still render its current state.
+        if "paused" not in str(exc).lower():
+            raise
 
     game = await svc.get_world(str(game["id"]))
-
     result["game"] = await svc.snapshot(
         str(game["id"]),
         user_id,
         include_unjoined=True,
     )
-    result["is_admin"] = await can_group_admin(
-        request,
-        game,
-        user_id,
-    )
-    result["can_moderate"] = await can_moderate(
-        request,
-        game,
-        user_id,
-    )
+    result["is_admin"] = await can_group_admin(request, game, user_id)
+    result["can_moderate"] = await can_moderate(request, game, user_id)
     result["can_terminate"] = (
         bool(CONFIG.bot_creator_id and user_id == CONFIG.bot_creator_id)
         or int(game.get("creator_id") or 0) == user_id
@@ -349,13 +314,8 @@ async def join_world(
     x_telegram_init_data: str | None = Header(default=None),
 ) -> dict[str, Any]:
     user, _, _ = await auth_user(x_telegram_init_data)
-    maintenance = await maintenance_response()
-
-    if maintenance:
-        raise HTTPException(
-            status_code=503,
-            detail="Maintenance is active. Your world is safe; try again when it ends.",
-        )
+    if await maintenance_response():
+        raise HTTPException(status_code=503, detail="Maintenance is active. Your world is safe.")
 
     svc = service()
     player = await svc.join(
@@ -364,14 +324,8 @@ async def join_world(
         str(user.get("username") or ""),
         str(user.get("first_name") or "Player"),
     )
-    snapshot = await svc.snapshot(
-        body.game_id,
-        int(user["id"]),
-    )
-    await refresh_group_card(
-        request,
-        await svc.get_world(body.game_id),
-    )
+    snapshot = await svc.snapshot(body.game_id, int(user["id"]))
+    await refresh_group_card(request, await svc.get_world(body.game_id))
     return {"player": player, "snapshot": snapshot}
 
 
@@ -381,11 +335,7 @@ async def get_world(
     x_telegram_init_data: str | None = Header(default=None),
 ) -> dict[str, Any]:
     user, _, _ = await auth_user(x_telegram_init_data)
-    return await service().snapshot(
-        game_id,
-        int(user["id"]),
-        include_unjoined=True,
-    )
+    return await service().snapshot(game_id, int(user["id"]), include_unjoined=True)
 
 
 @router.post("/choice")
@@ -395,13 +345,8 @@ async def choose(
     x_telegram_init_data: str | None = Header(default=None),
 ) -> dict[str, Any]:
     user, _, _ = await auth_user(x_telegram_init_data)
-    maintenance = await maintenance_response()
-
-    if maintenance:
-        raise HTTPException(
-            status_code=503,
-            detail="Maintenance is active. Your progress is safe.",
-        )
+    if await maintenance_response():
+        raise HTTPException(status_code=503, detail="Maintenance is active. Your progress is safe.")
 
     try:
         result = await service().choose(
@@ -409,21 +354,12 @@ async def choose(
             int(user["id"]),
             body.choice_id,
         )
-        await refresh_group_card(
-            request,
-            await service().get_world(body.game_id),
-        )
+        await refresh_group_card(request, await service().get_world(body.game_id))
         return result
     except DatabaseConflict as exc:
-        raise HTTPException(
-            status_code=409,
-            detail="Someone else just changed the world. Refreshing your current scene…",
-        ) from exc
+        raise HTTPException(status_code=409, detail="The world changed. Refresh your scene.") from exc
     except (DatabaseError, ValueError) as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc),
-        ) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/invite")
@@ -434,38 +370,16 @@ async def invite(
 ) -> dict[str, Any]:
     user, _, _ = await auth_user(x_telegram_init_data)
     svc = service()
-    player = await svc.get_player(
-        body.game_id,
-        int(user["id"]),
-    )
-
+    player = await svc.get_player(body.game_id, int(user["id"]))
     if not player:
-        raise HTTPException(
-            status_code=403,
-            detail="Join the world before inviting friends.",
-        )
+        raise HTTPException(status_code=403, detail="Join the world before inviting friends.")
 
     game = await svc.get_world(body.game_id)
-    if not (game.get("settings") or {}).get(
-        "allow_external_invites",
-        True,
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail="External invites are disabled for this world.",
-        )
+    if not (game.get("settings") or {}).get("allow_external_invites", True):
+        raise HTTPException(status_code=403, detail="External invites are disabled for this world.")
 
-    token = await svc.create_invite(
-        body.game_id,
-        int(user["id"]),
-    )
-    return {
-        "token": token,
-        "link": app_deep_link(
-            request,
-            f"invite_{token}",
-        ),
-    }
+    token = await svc.create_invite(body.game_id, int(user["id"]))
+    return {"token": token, "link": app_deep_link(request, f"invite_{token}")}
 
 
 @router.post("/settings/invites")
@@ -477,25 +391,12 @@ async def set_invites(
     user, _, _ = await auth_user(x_telegram_init_data)
     game = await service().get_world(body.game_id)
 
-    if not await can_group_admin(
-        request,
-        game,
-        int(user["id"]),
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail="Only the group owner/admin or world creator can change settings.",
-        )
+    if not await can_group_admin(request, game, int(user["id"])):
+        raise HTTPException(status_code=403, detail="Only the group owner/admin or world creator can change settings.")
 
     settings = dict(game.get("settings") or {})
-    settings["allow_external_invites"] = not bool(
-        settings.get("allow_external_invites", True)
-    )
-
-    updated = await service().update_settings(
-        body.game_id,
-        {"settings": settings},
-    )
+    settings["allow_external_invites"] = not bool(settings.get("allow_external_invites", True))
+    updated = await service().update_settings(body.game_id, {"settings": settings})
     return {"settings": updated.get("settings") or settings}
 
 
@@ -509,36 +410,18 @@ async def set_operator(
     game = await service().get_world(body.game_id)
 
     if int(game.get("creator_id") or 0) != int(user["id"]) and not (
-        CONFIG.bot_creator_id
-        and CONFIG.bot_creator_id == int(user["id"])
+        CONFIG.bot_creator_id and CONFIG.bot_creator_id == int(user["id"])
     ):
-        raise HTTPException(
-            status_code=403,
-            detail="Only the world creator or bot creator can assign operators.",
-        )
+        raise HTTPException(status_code=403, detail="Only the world creator or bot creator can assign operators.")
 
-    current = [
-        int(x)
-        for x in (game.get("settings") or {}).get(
-            "operator_ids",
-            [],
-        )
-    ]
-
+    current = [int(x) for x in (game.get("settings") or {}).get("operator_ids", [])]
     if body.action == "add" and body.user_id not in current:
         current.append(body.user_id)
-
     if body.action == "remove":
         current = [x for x in current if x != body.user_id]
 
-    updated = await service().set_operators(
-        body.game_id,
-        current,
-    )
-    return {
-        "settings": updated.get("settings")
-        or {"operator_ids": current}
-    }
+    updated = await service().set_operators(body.game_id, current)
+    return {"settings": updated.get("settings") or {"operator_ids": current}}
 
 
 @router.post("/moderation/pause")
@@ -549,21 +432,9 @@ async def pause(
 ) -> dict[str, Any]:
     user, _, _ = await auth_user(x_telegram_init_data)
     game = await service().get_world(body.game_id)
-
-    if not await can_moderate(
-        request,
-        game,
-        int(user["id"]),
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail="You do not have permission to pause this world.",
-        )
-
-    updated = await service().pause(
-        body.game_id,
-        int(user["id"]),
-    )
+    if not await can_moderate(request, game, int(user["id"])):
+        raise HTTPException(status_code=403, detail="You do not have permission to pause this world.")
+    updated = await service().pause(body.game_id, int(user["id"]))
     await refresh_group_card(request, updated)
     return {"game": updated}
 
@@ -576,21 +447,9 @@ async def resume(
 ) -> dict[str, Any]:
     user, _, _ = await auth_user(x_telegram_init_data)
     game = await service().get_world(body.game_id)
-
-    if not await can_moderate(
-        request,
-        game,
-        int(user["id"]),
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail="You do not have permission to resume this world.",
-        )
-
-    updated = await service().resume(
-        body.game_id,
-        int(user["id"]),
-    )
+    if not await can_moderate(request, game, int(user["id"])):
+        raise HTTPException(status_code=403, detail="You do not have permission to resume this world.")
+    updated = await service().resume(body.game_id, int(user["id"]))
     await refresh_group_card(request, updated)
     return {"game": updated}
 
@@ -604,20 +463,11 @@ async def terminate(
     user, _, _ = await auth_user(x_telegram_init_data)
     game = await service().get_world(body.game_id)
     user_id = int(user["id"])
-
     if user_id != int(game.get("creator_id") or 0) and not (
-        CONFIG.bot_creator_id
-        and user_id == CONFIG.bot_creator_id
+        CONFIG.bot_creator_id and user_id == CONFIG.bot_creator_id
     ):
-        raise HTTPException(
-            status_code=403,
-            detail="Only the world creator or bot creator can terminate a world.",
-        )
-
-    updated = await service().terminate(
-        body.game_id,
-        user_id,
-    )
+        raise HTTPException(status_code=403, detail="Only the world creator or bot creator can terminate a world.")
+    updated = await service().terminate(body.game_id, user_id)
     await refresh_group_card(request, updated)
     return {"game": updated}
 
@@ -627,11 +477,7 @@ def mount_static(app: Any) -> None:
 
     assets = STATIC_DIR / "assets"
     assets.mkdir(parents=True, exist_ok=True)
-    app.mount(
-        "/app/assets",
-        StaticFiles(directory=str(assets)),
-        name="miniapp-assets",
-    )
+    app.mount("/app/assets", StaticFiles(directory=str(assets)), name="miniapp-assets")
 
     @app.get("/app", include_in_schema=False)
     async def miniapp_index() -> FileResponse:
