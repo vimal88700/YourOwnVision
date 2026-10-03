@@ -3,127 +3,151 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
-  <meta name="theme-color" content="#070a11">
+  <meta name="theme-color" content="#08090d">
   <meta name="color-scheme" content="dark">
   <title>WHAT HAPPENS?</title>
   <script src="https://telegram.org/js/telegram-web-app.js?63"></script>
-  <link rel="stylesheet" href="/app/assets/style.css">
+  <style>
+    :root{
+      --bg:#08090d;--surface:#0f1117;--surface2:#141821;--surface3:#1a1f2a;
+      --text:#f4f1ea;--muted:#9298a4;--dim:#5f6570;--line:rgba(255,255,255,.09);
+      --gold:#c8a66a;--gold2:#ead29d;--green:#6fd0a3;--red:#e46f78;--blue:#7e96b8;
+      --shadow:0 24px 80px rgba(0,0,0,.42);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif
+    }
+    *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+    html,body{margin:0;background:var(--bg);color:var(--text);min-height:100%;overflow-x:hidden}
+    body{
+      background:
+        radial-gradient(900px 500px at 15% -10%,rgba(200,166,106,.10),transparent 65%),
+        radial-gradient(850px 520px at 110% 20%,rgba(85,105,145,.11),transparent 65%),
+        linear-gradient(180deg,#090a0f 0%,#07080c 100%);
+    }
+    button,input{font:inherit}
+    button{cursor:pointer}
+    .grain{position:fixed;inset:0;pointer-events:none;opacity:.035;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120' viewBox='0 0 120 120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.8'/%3E%3C/svg%3E")}
+    .app{position:relative;z-index:1;width:min(760px,100%);margin:auto;padding:calc(16px + env(safe-area-inset-top)) 16px calc(104px + env(safe-area-inset-bottom))}
+    .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
+    .brand{display:flex;align-items:center;gap:12px}.mark{width:44px;height:44px;border:1px solid rgba(234,210,157,.28);border-radius:13px;display:grid;place-items:center;color:var(--gold2);font-weight:900;letter-spacing:-.08em;background:linear-gradient(145deg,#1a1814,#0f1117);box-shadow:0 12px 35px rgba(0,0,0,.35)}
+    .eyebrow{font-size:9px;letter-spacing:.22em;font-weight:850;color:var(--gold);text-transform:uppercase}.brand h1{font-size:16px;margin:3px 0 0;letter-spacing:.02em}
+    .top-actions{display:flex;gap:8px}.icon{width:42px;height:42px;border-radius:50%;border:1px solid var(--line);background:#101319;color:#e7e2d7}
+    .panel{border:1px solid var(--line);border-radius:26px;background:linear-gradient(150deg,rgba(22,25,33,.97),rgba(12,14,19,.97));box-shadow:var(--shadow);padding:18px;margin-bottom:12px}
+    .hidden{display:none!important}.loading{display:flex;align-items:center;gap:13px;min-height:84px}.loading b{font-size:13px}.loading span{display:block;color:var(--muted);font-size:10px;margin-top:4px}.spinner{width:18px;height:18px;border:2px solid #30343d;border-top-color:var(--gold);border-radius:50%;animation:spin .7s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
+    .hero{position:relative;overflow:hidden;padding:30px 22px;background:radial-gradient(600px 280px at 100% 0,rgba(200,166,106,.13),transparent 70%),linear-gradient(145deg,#171a21,#0c0e13)}
+    .hero:after{content:"";position:absolute;right:-80px;bottom:-120px;width:260px;height:260px;border:1px solid rgba(200,166,106,.13);border-radius:50%;box-shadow:0 0 0 36px rgba(200,166,106,.025),0 0 0 72px rgba(200,166,106,.018)}
+    .hero h2{position:relative;z-index:1;font-family:Georgia,"Times New Roman",serif;font-size:46px;line-height:.96;letter-spacing:-.055em;font-weight:500;margin:11px 0 16px;max-width:620px}
+    .hero p{position:relative;z-index:1;color:#c4c6ca;font-size:14px;line-height:1.75;max-width:620px;margin:0 0 18px}.hero-note{position:relative;z-index:1;border-left:2px solid var(--gold);padding:10px 0 10px 13px;color:#a9adb5;font-size:10px;line-height:1.6;max-width:620px}
+    .feature-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.mini{padding:15px;border:1px solid var(--line);border-radius:19px;background:#0d1016}.mini .num{font-family:Georgia,serif;color:var(--gold2);font-size:23px}.mini b{display:block;font-size:12px;margin-top:12px}.mini small{display:block;color:var(--muted);font-size:9px;line-height:1.5;margin-top:5px}
+    .world-head{display:flex;align-items:flex-start;justify-content:space-between;padding:16px 18px}.world-head h2{font-family:Georgia,serif;font-size:27px;font-weight:500;margin:4px 0 5px;letter-spacing:-.035em}.location{display:flex;gap:7px;color:#a2a6af;font-size:10px}.location i{color:#4c515a;font-style:normal}.status{padding:6px 9px;border-radius:999px;border:1px solid var(--line);font-size:8px;font-weight:900;letter-spacing:.16em}.status.live{color:var(--green);border-color:rgba(111,208,163,.2);background:rgba(111,208,163,.05)}.status.waiting{color:var(--gold2);border-color:rgba(200,166,106,.22);background:rgba(200,166,106,.05)}
+    .lobby{background:linear-gradient(145deg,#15181e,#0d0f14)}.lobby-head{display:flex;justify-content:space-between;align-items:center}.lobby h3{font-family:Georgia,serif;font-size:22px;font-weight:500;margin:4px 0}.countdown{min-width:74px;text-align:center;padding:9px 10px;border:1px solid var(--line);border-radius:16px;background:#0a0c10}.countdown b{display:block;font-size:27px;font-weight:600}.countdown span{font-size:8px;color:var(--muted);letter-spacing:.16em}
+    .muted{color:var(--muted);font-size:10px;line-height:1.7}.section{display:flex;align-items:center;justify-content:space-between;margin:17px 0 10px}.section h3{font-size:15px;margin:4px 0 0}.badge{min-width:31px;height:31px;border-radius:10px;display:grid;place-items:center;background:#1b1f27;color:#ddd7cb;font-weight:800}
+    .roster{display:grid;gap:7px}.player{display:flex;align-items:center;gap:10px;padding:10px;border:1px solid var(--line);border-radius:15px;background:#0c0f14}.avatar{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;background:linear-gradient(145deg,#3a3d45,#1c2028);border:1px solid rgba(255,255,255,.08);font-size:11px;font-weight:900;color:#ece6da}.pname{flex:1;min-width:0}.pname b{display:block;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pname small{display:block;color:var(--muted);font-size:8px;margin-top:3px}.dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 0 4px rgba(111,208,163,.06)}
+    .pause{display:flex;gap:13px;align-items:flex-start}.pause-symbol{width:43px;height:43px;border-radius:14px;display:grid;place-items:center;color:var(--gold2);background:#19150f;border:1px solid rgba(200,166,106,.16);font-weight:900}.pause h3{font-family:Georgia,serif;font-size:21px;font-weight:500;margin:2px 0 5px}
+    .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}.stat{padding:11px;border:1px solid var(--line);border-radius:15px;background:#0c0f14}.stat span{display:block;color:var(--muted);font-size:7px;letter-spacing:.13em;font-weight:900}.stat b{display:block;font-size:17px;margin-top:4px}.meter{height:4px;background:#242831;border-radius:99px;margin:7px 1px 12px;overflow:hidden}.meter span{display:block;height:100%;width:100%;background:linear-gradient(90deg,#8a6c43,#d9bd7d);transition:width .12s linear}
+    .story{padding:22px;background:radial-gradient(600px 250px at 100% 0,rgba(200,166,106,.10),transparent 68%),linear-gradient(145deg,#171a20,#0c0e13)}.story-meta{display:flex;gap:7px;align-items:center;margin-bottom:12px}.tag{padding:5px 8px;border-radius:7px;background:#20242c;color:#bfc3ca;font-size:8px;font-weight:900;letter-spacing:.13em}.meet{padding:5px 8px;border-radius:7px;background:rgba(111,208,163,.07);color:var(--green);font-size:8px;font-weight:900;letter-spacing:.13em}.story h2{font-family:Georgia,serif;font-size:34px;line-height:1.05;font-weight:500;letter-spacing:-.045em;margin:0 0 13px}.story p{font-size:15px;line-height:1.78;color:#dedbd4;margin:0}.npc{margin-top:17px;padding-top:13px;border-top:1px solid var(--line);color:#9da1aa;font-size:10px}
+    .choices{display:grid;gap:8px;margin:10px 0 14px}.choice{position:relative;display:grid;grid-template-columns:34px 1fr 18px;gap:10px;align-items:center;text-align:left;width:100%;min-height:76px;padding:12px;border:1px solid var(--line);border-radius:18px;background:linear-gradient(145deg,#15181e,#0d0f14);color:var(--text);transition:transform .06s,border-color .08s}.choice:active,.choice.pressed{transform:scale(.986);border-color:rgba(200,166,106,.45)}.choice:disabled{opacity:.62}.idx{width:29px;height:29px;border-radius:9px;display:grid;place-items:center;background:#20242b;color:var(--gold2);font-size:10px;font-weight:900}.copy b{display:block;font-size:12px;line-height:1.25}.copy small{display:block;color:var(--muted);font-size:9px;line-height:1.5;margin-top:4px}.arrow{font-size:23px;color:#5e636c}
+    .subhead{display:block;margin-top:18px}.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.chip{padding:6px 9px;border-radius:999px;background:#191d24;color:#c9c5bb;font-size:9px}.chip.dim{color:#a5a9b0}
+    .setting{width:100%;display:flex;align-items:center;justify-content:space-between;text-align:left;border:1px solid var(--line);border-radius:16px;background:#0c0f14;color:var(--text);padding:13px}.setting:disabled{opacity:.5}.setting b{display:block;font-size:11px}.setting small{display:block;color:var(--muted);font-size:8px;margin-top:4px}.setting strong{font-size:9px;color:var(--green)}.controls{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:7px}.secondary,.danger{border:1px solid var(--line);border-radius:14px;padding:12px;background:#141820;color:#ece8df;font-weight:800}.secondary:disabled{opacity:.45}.danger{width:100%;margin-top:10px;color:#f1a3aa;border-color:rgba(228,111,120,.2);background:rgba(228,111,120,.05)}
+    .operator{margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}.operator-row{display:grid;grid-template-columns:1fr auto auto;gap:6px;margin-top:8px}.operator input{min-width:0;border:1px solid var(--line);border-radius:13px;background:#0a0d12;color:var(--text);padding:11px;outline:none}.tiny{display:block;color:var(--muted);font-size:8px;line-height:1.5;margin-top:6px}
+    .bottom{position:fixed;left:50%;bottom:calc(10px + env(safe-area-inset-bottom));transform:translateX(-50%);width:min(540px,calc(100% - 30px));display:grid;grid-template-columns:repeat(3,1fr);gap:4px;padding:6px;border:1px solid var(--line);border-radius:22px;background:rgba(9,10,14,.92);backdrop-filter:blur(20px);box-shadow:0 18px 50px rgba(0,0,0,.55);z-index:20}.bottom button{border:0;border-radius:15px;background:transparent;color:#777c85;padding:8px 4px;font-size:9px;font-weight:850}.bottom button span{display:block;font-size:14px;margin-bottom:2px}.bottom button.active{background:#1b1e25;color:#e9e4d9}
+    .toast{position:fixed;left:15px;right:15px;bottom:calc(82px + env(safe-area-inset-bottom));z-index:30;padding:13px 15px;border:1px solid var(--line);border-radius:15px;background:#181b22;box-shadow:0 18px 50px rgba(0,0,0,.45);font-size:10px}.toast.good{color:#bce7d4;border-color:rgba(111,208,163,.25)}.toast.bad{color:#f3bcc0;border-color:rgba(228,111,120,.28)}
+    @media(min-width:650px){.app{padding-top:28px}.story h2{font-size:40px}.hero h2{font-size:58px}}
+  </style>
 </head>
 <body>
-  <div class="stars"></div>
-  <main class="app">
-    <header class="topbar">
-      <div class="brand">
-        <div class="brand-mark">WH</div>
-        <div>
-          <div class="eyebrow">YOUR OWN VISION</div>
-          <h1>WHAT HAPPENS?</h1>
-        </div>
-      </div>
-      <div class="top-actions">
-        <button id="soundBtn" class="icon-btn" type="button" aria-label="Sound">◉</button>
-        <button id="inviteBtn" class="icon-btn" type="button" aria-label="Invite">＋</button>
-      </div>
-    </header>
+<div class="grain"></div>
+<main class="app">
+  <header class="topbar">
+    <div class="brand">
+      <div class="mark">WH</div>
+      <div><div class="eyebrow">YOUR OWN VISION</div><h1>WHAT HAPPENS?</h1></div>
+    </div>
+    <div class="top-actions">
+      <button id="soundBtn" class="icon" type="button" aria-label="Sound">◉</button>
+      <button id="inviteBtn" class="icon" type="button" aria-label="Invite">＋</button>
+    </div>
+  </header>
 
-    <section id="statusCard" class="panel loading">
-      <div class="spinner"></div>
-      <div><b>Entering the world…</b><span>Verifying your Telegram session.</span></div>
+  <section id="statusCard" class="panel loading">
+    <div class="spinner"></div>
+    <div><b>ENTERING WORLD</b><span>Verifying your Telegram session…</span></div>
+  </section>
+
+  <section id="home" class="hidden">
+    <div class="panel hero">
+      <div class="eyebrow">A LIVING MULTIPLAYER STORY</div>
+      <h2 id="homeTitle">The world is waiting.</h2>
+      <p>Your group shares one persistent world. Your decisions create a personal route, while the wider world remembers consequences and periodically pulls players into the same turning points.</p>
+      <div class="hero-note">Use <b>/play</b> in a group. The bot creates the group world automatically. Opening this screen never creates or resets a world.</div>
+    </div>
+    <div class="feature-grid">
+      <article class="mini"><div class="num">01</div><b>CONTINUOUS</b><small>No forced story rounds. The world survives restarts and deployments.</small></article>
+      <article class="mini"><div class="num">02</div><b>RELATIONSHIPS</b><small>People react to your history, risks and promises.</small></article>
+      <article class="mini"><div class="num">03</div><b>CONVERGENCE</b><small>Separate paths meet at shared events instead of becoming separate games.</small></article>
+    </div>
+  </section>
+
+  <section id="world" class="hidden">
+    <div class="panel world-head">
+      <div><div class="eyebrow">LIVE WORLD</div><h2 id="worldTitle">WHAT HAPPENS?</h2><div class="location"><span id="dimension">Unknown</span><i>•</i><span id="location">Unknown</span></div></div>
+      <span id="worldStatus" class="status live">LIVE</span>
+    </div>
+
+    <section id="lobbyPanel" class="panel lobby hidden">
+      <div class="lobby-head">
+        <div><div class="eyebrow">ENTRY WINDOW</div><h3>Players are arriving.</h3></div>
+        <div class="countdown"><b id="lobbyTimer">45</b><span>SECONDS</span></div>
+      </div>
+      <p class="muted">The clock only controls the entry window. The world itself has no round timer and remains saved after the lobby closes.</p>
+      <div class="section"><div><div class="eyebrow">ROSTER</div><h3>Players</h3></div><span id="playerCount" class="badge">0</span></div>
+      <div id="lobbyPlayers" class="roster"></div>
     </section>
 
-    <section id="home" class="hidden">
-      <div class="hero panel">
-        <span class="hero-kicker">A LIVING MULTIPLAYER STORY</span>
-        <h2 id="homeTitle">Open a world from a group.</h2>
-        <p>No forced rounds. No repetitive scripts. Your choices create personal paths while the shared world keeps moving.</p>
-        <div class="hero-note">Use <b>/play</b> in a group, then open the game button. A world is created automatically — never from this screen.</div>
-      </div>
-      <div class="feature-grid">
-        <article class="mini-panel"><span>∞</span><b>Continuous</b><small>The 45s clock is only the lobby.</small></article>
-        <article class="mini-panel"><span>♥</span><b>Relationships</b><small>Characters react to what you do.</small></article>
-        <article class="mini-panel"><span>◇</span><b>Many paths</b><small>Bad choices can change your route, not erase the world.</small></article>
-      </div>
+    <section id="pausedPanel" class="panel pause hidden">
+      <div class="pause-symbol">Ⅱ</div>
+      <div><div class="eyebrow">WORLD PAUSED</div><h3>The story is waiting.</h3><p class="muted">No progress was deleted. An authorized moderator can resume the same world.</p></div>
     </section>
 
-    <section id="world" class="hidden">
-      <div class="world-head panel">
-        <div>
-          <div class="eyebrow">LIVE WORLD</div>
-          <h2 id="worldTitle">WHAT HAPPENS?</h2>
-          <div class="location-line"><span id="dimension">The Unknown</span><i>•</i><span id="location">Somewhere</span></div>
-        </div>
-        <span id="worldStatus" class="status-pill live">LIVE</span>
+    <section id="storyPanel" class="hidden">
+      <div class="stats">
+        <div class="stat"><span>CHANCES</span><b id="lifeText">3</b></div>
+        <div class="stat"><span>HEALTH</span><b id="health">100</b></div>
+        <div class="stat"><span>ENERGY</span><b id="energy">100</b></div>
+        <div class="stat"><span>WORLD TURN</span><b id="worldTurn">0</b></div>
       </div>
+      <div class="meter"><span id="healthBar"></span></div>
 
-      <section id="lobbyPanel" class="panel hidden">
-        <div class="lobby-banner">
-          <div><span class="eyebrow">LOBBY</span><h3>Players are arriving</h3></div>
-          <div class="countdown"><b id="lobbyTimer">45</b><span>sec</span></div>
-        </div>
-        <p class="muted">This timer only controls joining. When it reaches zero, the story begins. If nobody ever joins, this world stays here and can be reopened by /play.</p>
-        <div class="section-head"><div><span class="eyebrow">CONNECTED</span><h3>Players</h3></div><span id="playerCount" class="count-badge">0</span></div>
-        <div id="lobbyPlayers" class="roster"></div>
-      </section>
-
-      <section id="pausedPanel" class="panel hidden pause-panel">
-        <div class="pause-icon">Ⅱ</div>
-        <div><span class="eyebrow">WORLD PAUSED</span><h3>The story is waiting.</h3><p class="muted">No progress is deleted. A permitted moderator can resume it at any time.</p></div>
-      </section>
-
-      <section id="storyPanel" class="hidden">
-        <div class="stats">
-          <div><span>CHANCES</span><b id="lifeText">3</b></div>
-          <div><span>HEALTH</span><b id="health">100</b></div>
-          <div><span>ENERGY</span><b id="energy">100</b></div>
-          <div><span>WORLD TURN</span><b id="worldTurn">0</b></div>
-        </div>
-        <div class="meter"><span id="healthBar"></span></div>
-
-        <article class="story-card panel">
-          <div class="story-top"><span id="sceneCategory" class="tag">STORY</span><span id="sceneConvergence" class="convergence hidden">EVERYONE MEETS</span></div>
-          <h2 id="sceneTitle">—</h2>
-          <p id="sceneText">—</p>
-          <div id="npcLine" class="npc-line"></div>
-        </article>
-        <div id="choices" class="choices"></div>
-      </section>
-
-      <section id="peoplePanel" class="panel hidden">
-        <div class="section-head"><div><span class="eyebrow">THIS WORLD</span><h3>People</h3></div><span id="peopleCount" class="count-badge">0</span></div>
-        <div id="peopleList" class="roster"></div>
-        <div class="eyebrow subhead">YOUR RELATIONSHIPS</div>
-        <div id="relationships" class="chips"></div>
-        <div class="eyebrow subhead">DISCOVERED DIMENSIONS</div>
-        <div id="discoveries" class="chips"></div>
-      </section>
-
-      <section id="settingsPanel" class="panel hidden">
-        <div class="section-head"><div><span class="eyebrow">CONTROL</span><h3>World settings</h3></div></div>
-        <button id="toggleInvites" class="setting-row"><span><b>Friends outside the group</b><small>Allow invite links to join this world.</small></span><strong id="inviteSetting">ON</strong></button>
-        <div class="control-grid">
-          <button id="pauseBtn" class="secondary-btn">Pause</button>
-          <button id="resumeBtn" class="secondary-btn">Resume</button>
-        </div>
-        <div id="terminateWrap" class="terminate-wrap hidden">
-          <button id="terminateBtn" class="danger-btn">Terminate this world</button>
-          <small>Only the world creator or bot creator can terminate. Group admins cannot.</small>
-        </div>
-        <div id="operatorWrap" class="operator-wrap hidden">
-          <div class="eyebrow">ASSIGNED OPERATORS</div>
-          <div class="operator-row"><input id="operatorId" inputmode="numeric" placeholder="Telegram user ID"><button id="operatorAdd" class="secondary-btn">Add</button><button id="operatorRemove" class="secondary-btn">Remove</button></div>
-          <small>Operators can pause/resume. They cannot terminate the world.</small>
-        </div>
-      </section>
+      <article class="panel story">
+        <div class="story-meta"><span id="sceneCategory" class="tag">STORY</span><span id="sceneConvergence" class="meet hidden">EVERYONE MEETS</span></div>
+        <h2 id="sceneTitle">—</h2>
+        <p id="sceneText">—</p>
+        <div id="npcLine" class="npc"></div>
+      </article>
+      <div id="choices" class="choices"></div>
     </section>
 
-    <nav id="bottomNav" class="bottom-nav hidden">
-      <button data-tab="story" class="active"><span>◈</span>Story</button>
-      <button data-tab="people"><span>♧</span>People</button>
-      <button id="settingsNav" data-tab="settings" class="hidden"><span>⚙</span>Control</button>
-    </nav>
+    <section id="peoplePanel" class="panel hidden">
+      <div class="section"><div><div class="eyebrow">THIS WORLD</div><h3>People</h3></div><span id="peopleCount" class="badge">0</span></div>
+      <div id="peopleList" class="roster"></div>
+      <div class="eyebrow subhead">YOUR RELATIONSHIPS</div><div id="relationships" class="chips"></div>
+      <div class="eyebrow subhead">DISCOVERED DIMENSIONS</div><div id="discoveries" class="chips"></div>
+    </section>
 
-    <div id="toast" class="toast hidden"></div>
-  </main>
-  <script src="/app/assets/app.js"></script>
+    <section id="settingsPanel" class="panel hidden">
+      <div class="section"><div><div class="eyebrow">CONTROL ROOM</div><h3>World settings</h3></div></div>
+      <button id="toggleInvites" class="setting"><span><b>OUTSIDE INVITES</b><small>Allow players who are not in the group to enter.</small></span><strong id="inviteSetting">ON</strong></button>
+      <div class="controls"><button id="pauseBtn" class="secondary">Pause</button><button id="resumeBtn" class="secondary">Resume</button></div>
+      <div id="terminateWrap" class="hidden"><button id="terminateBtn" class="danger">Terminate world</button><small class="tiny">Only the world creator or bot creator can terminate. Group admins cannot.</small></div>
+      <div id="operatorWrap" class="operator hidden"><div class="eyebrow">ASSIGNED OPERATORS</div><div class="operator-row"><input id="operatorId" inputmode="numeric" placeholder="Telegram user ID"><button id="operatorAdd" class="secondary">Add</button><button id="operatorRemove" class="secondary">Remove</button></div><small class="tiny">Operators can pause/resume but cannot terminate.</small></div>
+    </section>
+  </section>
+
+  <nav id="bottomNav" class="bottom hidden">
+    <button data-tab="story" class="active"><span>◈</span>Story</button>
+    <button data-tab="people"><span>♧</span>People</button>
+    <button id="settingsNav" data-tab="settings" class="hidden"><span>⚙</span>Control</button>
+  </nav>
+  <div id="toast" class="toast hidden"></div>
+</main>
+<script src="/app/assets/app.js"></script>
 </body>
 </html>
