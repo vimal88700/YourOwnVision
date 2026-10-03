@@ -18,6 +18,10 @@ from bot import (
 from config import CONFIG
 
 
+# ============================================================
+# LOGGING
+# ============================================================
+
 logging.basicConfig(
     level=getattr(
         logging,
@@ -34,6 +38,11 @@ logging.basicConfig(
 
 logger = logging.getLogger("YourOwnVision.main")
 
+
+# ============================================================
+# TELEGRAM APPLICATION
+# ============================================================
+
 telegram_application = create_application()
 
 recovery_task: asyncio.Task[None] | None = None
@@ -42,12 +51,9 @@ shutdown_event = asyncio.Event()
 RECOVERY_INTERVAL_SECONDS = 10
 
 
-class RecoveryContext:
-    """Adapter used by publish_current_scene during recovery."""
-
-    def __init__(self, bot: Any) -> None:
-        self.bot = bot
-
+# ============================================================
+# WEBHOOK URL
+# ============================================================
 
 def webhook_url() -> str:
     base = CONFIG.public_base_url.rstrip("/")
@@ -58,6 +64,10 @@ def webhook_url() -> str:
 
     return f"{base}{path}"
 
+
+# ============================================================
+# TELEGRAM WEBHOOK REGISTRATION
+# ============================================================
 
 async def configure_telegram_webhook() -> None:
     url = webhook_url()
@@ -88,29 +98,48 @@ async def configure_telegram_webhook() -> None:
     )
 
 
+# ============================================================
+# GAME RECOVERY
+# ============================================================
+
+class RecoveryContext:
+    """Minimal adapter: publish_current_scene only needs .bot."""
+    def __init__(self, bot: Any) -> None:
+        self.bot = bot
+
+
 async def recover_games_and_publish() -> None:
     """
-    Recover persistent game state and publish any player-facing
-    Telegram state created by that recovery.
+    Recover database-owned transitions and publish the resulting
+    scene/decision state to Telegram.
 
-    PostgreSQL owns the game transition, but PostgreSQL cannot send
-    Telegram messages. Therefore a recovered lobby start or recovered
-    round must be published by the application process.
+    IMPORTANT:
+    recover_all_due_games() returns two shapes:
+      - a game row for a lobby that just started;
+      - a resolution wrapper containing {"game": <game row>} for
+        a round that just timed out/resolved.
+
+    Both must be published.
     """
-
     logger.info(
         "Recovering active WHAT HAPPENS? games from Supabase..."
     )
 
     results = await game_service.recover_all_due_games()
-
     published = 0
 
-    for game in results:
-        if game.get("status") != "playing":
+    for item in results:
+        if not isinstance(item, dict):
             continue
 
-        game_id = game.get("id")
+        candidate = item.get("game")
+        if not isinstance(candidate, dict):
+            candidate = item
+
+        if candidate.get("status") != game_service.STATUS_PLAYING:
+            continue
+
+        game_id = candidate.get("id")
         if not game_id:
             continue
 
@@ -122,7 +151,6 @@ async def recover_games_and_publish() -> None:
                 str(game_id),
             )
             published += 1
-
         except Exception:
             logger.exception(
                 "Could not publish recovered game %s.",
@@ -144,7 +172,6 @@ async def recovery_loop() -> None:
 
     try:
         await recover_games_and_publish()
-
     except Exception:
         logger.exception(
             "Initial game recovery failed."
@@ -164,7 +191,6 @@ async def recovery_loop() -> None:
 
         try:
             await recover_games_and_publish()
-
         except Exception:
             logger.exception(
                 "Periodic game recovery failed."
@@ -174,6 +200,10 @@ async def recovery_loop() -> None:
         "Persistent game recovery loop stopped."
     )
 
+
+# ============================================================
+# FASTAPI LIFESPAN
+# ============================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -185,6 +215,8 @@ async def lifespan(app: FastAPI):
 
     shutdown_event.clear()
 
+    # python-telegram-bot is used only as an update processor.
+    # Telegram transport itself is handled by FastAPI.
     await telegram_application.initialize()
     await telegram_application.start()
 
@@ -192,8 +224,10 @@ async def lifespan(app: FastAPI):
         "Telegram application initialized."
     )
 
+    # Register the webhook on every startup.
     await configure_telegram_webhook()
 
+    # Recover any persistent game state.
     try:
         await recover_games_and_publish()
 
@@ -235,8 +269,17 @@ async def lifespan(app: FastAPI):
 
             recovery_task = None
 
-        # Never delete the Telegram webhook during Render shutdown.
-        # A new instance may already have registered the same webhook.
+        # IMPORTANT:
+        #
+        # DO NOT call delete_webhook() here.
+        #
+        # During a Render deploy, the old instance can receive
+        # SIGTERM after the new instance has already registered
+        # the webhook. Deleting it here can remove the webhook
+        # belonging to the new instance.
+        #
+        # The webhook is persistent Telegram configuration and
+        # should be replaced on startup, not deleted on shutdown.
 
         logger.info(
             "Leaving Telegram webhook registered."
@@ -263,6 +306,10 @@ async def lifespan(app: FastAPI):
         )
 
 
+# ============================================================
+# FASTAPI
+# ============================================================
+
 app = FastAPI(
     title="YourOwnVision",
     description="WHAT HAPPENS? deterministic Telegram story game.",
@@ -270,6 +317,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+# ============================================================
+# HEALTH
+# ============================================================
 
 @app.get(
     "/health",
@@ -282,6 +333,10 @@ async def health() -> dict[str, Any]:
         "environment": CONFIG.environment,
     }
 
+
+# ============================================================
+# TELEGRAM WEBHOOK
+# ============================================================
 
 @app.post(
     CONFIG.telegram_webhook_path,
@@ -301,6 +356,10 @@ async def telegram_webhook(
         request.headers.get("cf-ray", "<none>"),
     )
 
+    # --------------------------------------------------------
+    # SECURITY
+    # --------------------------------------------------------
+
     if (
         x_telegram_bot_api_secret_token
         != CONFIG.telegram_webhook_secret
@@ -313,6 +372,10 @@ async def telegram_webhook(
             status_code=403,
             detail="Forbidden",
         )
+
+    # --------------------------------------------------------
+    # JSON
+    # --------------------------------------------------------
 
     try:
         payload = await request.json()
@@ -333,6 +396,10 @@ async def telegram_webhook(
             status_code=400,
             detail="Telegram update must be a JSON object.",
         )
+
+    # --------------------------------------------------------
+    # TELEGRAM UPDATE
+    # --------------------------------------------------------
 
     try:
         update = Update.de_json(
@@ -361,6 +428,10 @@ async def telegram_webhook(
         update.update_id,
     )
 
+    # --------------------------------------------------------
+    # PROCESS
+    # --------------------------------------------------------
+
     try:
         await process_update(
             telegram_application,
@@ -384,6 +455,10 @@ async def telegram_webhook(
     }
 
 
+# ============================================================
+# TELEGRAM WEBHOOK DIAGNOSTICS
+# ============================================================
+
 @app.get(
     "/telegram/status",
     response_class=JSONResponse,
@@ -403,6 +478,10 @@ async def telegram_status() -> dict[str, Any]:
     }
 
 
+# ============================================================
+# ROOT
+# ============================================================
+
 @app.get(
     "/",
     response_class=JSONResponse,
@@ -416,6 +495,10 @@ async def root() -> dict[str, Any]:
         "telegram_status": "/telegram/status",
     }
 
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 def run() -> None:
     import uvicorn

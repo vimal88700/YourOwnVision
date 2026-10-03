@@ -66,9 +66,18 @@ class GameService:
         default_decision_seconds: int = 35,
         minimum_decision_seconds: int = 15,
         maximum_decision_seconds: int = 900,
+        maximum_players: int = 4,
     ) -> None:
         self.db = db
         self.story_generator = story_generator
+
+        self.max_players = max(
+            1,
+            min(
+                int(maximum_players),
+                50,
+            ),
+        )
 
         self.join_seconds = max(
             10,
@@ -382,9 +391,11 @@ class GameService:
         # The generator is therefore asked for the configured
         # minimum viable story. Later joins are still checked
         # against the actual playable roles.
+        story_player_count = self.max_players
+
         story, fingerprint = (
             await self.generate_unique_story(
-                player_count=1
+                player_count=story_player_count
             )
         )
 
@@ -412,14 +423,14 @@ class GameService:
                 join_deadline
             ),
             world_state=world_state,
-            story_player_count=1,
+            story_player_count=story_player_count,
         )
 
         try:
             await self.db.save_story_history(
                 fingerprint,
                 story,
-                player_count=1,
+                player_count=story_player_count,
             )
         except DatabaseConflict:
             logger.warning(
@@ -483,7 +494,9 @@ class GameService:
                     "A player who left cannot rejoin."
                 )
 
-            return existing
+            raise ValueError(
+                "You are already in this game."
+            )
 
         players = await self.db.get_players(
             game_id
@@ -497,7 +510,7 @@ class GameService:
             )
         )
 
-        if counted >= self.MAX_PLAYERS:
+        if counted >= self.max_players:
             raise ValueError(
                 "The game has reached its player limit."
             )

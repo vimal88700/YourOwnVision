@@ -26,6 +26,7 @@ game_service = GameService(
     default_decision_seconds=CONFIG.default_decision_seconds,
     minimum_decision_seconds=CONFIG.minimum_decision_seconds,
     maximum_decision_seconds=CONFIG.maximum_decision_seconds,
+    maximum_players=CONFIG.maximum_players,
 )
 
 
@@ -334,7 +335,7 @@ async def play(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"**{title}**\n\n"
         "✅ Story created and validated.\n\n"
         f"⏳ **JOINING IS OPEN FOR {format_seconds(remaining)}.**\n"
-        "There is no START button. When the 45-second lobby ends, the game starts automatically.\n\n"
+        "There is no game START button. When the 45-second lobby ends, the game starts automatically.\n\n"
         "Players may join at any time while the lobby is open.\n"
         "🔐 Open the bot privately and press START once so I can deliver your secret role and decisions.",
         reply_markup=InlineKeyboardMarkup(keyboard_rows),
