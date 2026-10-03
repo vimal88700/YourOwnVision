@@ -12,18 +12,12 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from config import CONFIG
 from database import Database
 from miniapp_api import configure_service, mount_static, router as miniapp_router
-from world_bot import (
-    maintenance_command,
-    pause_world,
-    resume_world,
-    terminate_world,
-    world_play,
-    world_start,
-)
+from world_bot import maintenance_command, pause_world, resume_world, terminate_world, world_play, world_start
 from world_service import WorldService
 
+LOG_LEVEL = str(CONFIG.log_level or "INFO").upper()
 logging.basicConfig(
-    level=getattr(CONFIG.log_level.upper(), logging.INFO),
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 logger = logging.getLogger("YourOwnVision.main")
@@ -36,7 +30,9 @@ telegram_application = Application.builder().token(CONFIG.telegram_token).build(
 
 def webhook_url() -> str:
     path = CONFIG.telegram_webhook_path
-    return f"{CONFIG.public_base_url.rstrip('/')}{path if path.startswith('/') else '/' + path}"
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"{CONFIG.public_base_url.rstrip('/')}{path}"
 
 
 def mini_app_url() -> str:
@@ -65,8 +61,7 @@ async def lifespan(app: FastAPI):
 
     telegram_application.add_handler(
         MessageHandler(
-            filters.ChatType.PRIVATE
-            & filters.Regex(r"^/start(?:@\w+)?\s+(?:invite_|w_).+"),
+            filters.ChatType.PRIVATE & filters.Regex(r"^/start(?:@\w+)?\s+(?:invite_|w_).+"),
             world_start,
         ),
         group=-20,
@@ -74,14 +69,8 @@ async def lifespan(app: FastAPI):
     telegram_application.add_handler(CommandHandler("play", world_play), group=-10)
     telegram_application.add_handler(CommandHandler("pause", pause_world), group=-10)
     telegram_application.add_handler(CommandHandler("resume", resume_world), group=-10)
-    telegram_application.add_handler(
-        CommandHandler(["endworld", "terminateworld"], terminate_world),
-        group=-10,
-    )
-    telegram_application.add_handler(
-        CommandHandler("maintenance", maintenance_command),
-        group=-10,
-    )
+    telegram_application.add_handler(CommandHandler(["endworld", "terminateworld"], terminate_world), group=-10)
+    telegram_application.add_handler(CommandHandler("maintenance", maintenance_command), group=-10)
 
     await telegram_application.initialize()
     await telegram_application.start()
@@ -89,7 +78,6 @@ async def lifespan(app: FastAPI):
     me = await telegram_application.bot.get_me()
     app.state.bot_username = me.username or ""
     app.state.telegram_bot = telegram_application.bot
-
     await configure_telegram()
     logger.info("YourOwnVision started as @%s", me.username)
 
@@ -104,7 +92,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="YourOwnVision",
     description="WHAT HAPPENS? — continuous multiplayer Telegram Mini App",
-    version="5.0.0",
+    version="5.1.0",
     lifespan=lifespan,
 )
 app.include_router(miniapp_router)
@@ -113,7 +101,7 @@ mount_static(app)
 
 @app.get("/health", response_class=JSONResponse)
 async def health() -> dict[str, Any]:
-    return {"status": "ok", "service": "YourOwnVision", "version": "5.0.0"}
+    return {"status": "ok", "service": "YourOwnVision", "version": "5.1.0"}
 
 
 @app.post(CONFIG.telegram_webhook_path, response_class=JSONResponse)
@@ -131,11 +119,8 @@ async def telegram_webhook(
         payload = await request.json()
         update = Update.de_json(payload, telegram_application.bot)
     except Exception as exc:
-        logger.exception("Invalid Telegram update")
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid Telegram update.",
-        ) from exc
+        logger.exception("Invalid Telegram update payload")
+        raise HTTPException(status_code=400, detail="Invalid Telegram update.") from exc
 
     if update is None:
         raise HTTPException(status_code=400, detail="Invalid Telegram update.")
@@ -143,8 +128,8 @@ async def telegram_webhook(
     try:
         await telegram_application.process_update(update)
     except Exception:
-        # Never make Telegram retry a valid update just because a downstream
-        # operation failed. The exception is logged for Render diagnostics.
+        # Telegram already delivered the update. Log the real failure but return
+        # 200 so Telegram does not redeliver the same command indefinitely.
         logger.exception("Telegram update processing failed")
 
     return {"ok": True}
@@ -174,13 +159,7 @@ async def root() -> dict[str, Any]:
 
 def run() -> None:
     import uvicorn
-
-    uvicorn.run(
-        app,
-        host=CONFIG.host,
-        port=CONFIG.port,
-        log_level=CONFIG.log_level.lower(),
-    )
+    uvicorn.run(app, host=CONFIG.host, port=CONFIG.port, log_level=LOG_LEVEL.lower())
 
 
 if __name__ == "__main__":
