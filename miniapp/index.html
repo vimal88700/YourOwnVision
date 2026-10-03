@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
-  <meta name="theme-color" content="#080b12">
+  <meta name="theme-color" content="#070a11">
   <meta name="color-scheme" content="dark">
   <title>WHAT HAPPENS?</title>
   <script src="https://telegram.org/js/telegram-web-app.js?63"></script>
   <link rel="stylesheet" href="/app/assets/style.css">
 </head>
 <body>
-  <div class="ambient"></div>
+  <div class="stars"></div>
   <main class="app">
     <header class="topbar">
       <div class="brand">
@@ -21,94 +21,105 @@
         </div>
       </div>
       <div class="top-actions">
-        <button id="soundBtn" class="round-btn" type="button" aria-label="Toggle sound">🔊</button>
-        <button id="inviteBtn" class="round-btn" type="button" aria-label="Invite a friend">＋</button>
+        <button id="soundBtn" class="icon-btn" type="button" aria-label="Sound">◉</button>
+        <button id="inviteBtn" class="icon-btn" type="button" aria-label="Invite">＋</button>
       </div>
     </header>
 
-    <section id="statusCard" class="panel loading-panel">
+    <section id="statusCard" class="panel loading">
       <div class="spinner"></div>
-      <div>
-        <strong>Entering the world…</strong>
-        <div class="muted">Syncing your Telegram session.</div>
-      </div>
+      <div><b>Entering the world…</b><span>Verifying your Telegram session.</span></div>
     </section>
 
     <section id="home" class="hidden">
       <div class="hero panel">
-        <div class="hero-kicker">A LIVING MULTIPLAYER STORY</div>
-        <h2>Your choices change the world.</h2>
-        <p>Explore, build relationships, take risks, recover from failure, and meet other players at shared turning points.</p>
-        <button id="createWorld" class="primary-btn">CREATE A WORLD</button>
+        <span class="hero-kicker">A LIVING MULTIPLAYER STORY</span>
+        <h2 id="homeTitle">Open a world from a group.</h2>
+        <p>No forced rounds. No repetitive scripts. Your choices create personal paths while the shared world keeps moving.</p>
+        <div class="hero-note">Use <b>/play</b> in a group, then open the game button. A world is created automatically — never from this screen.</div>
       </div>
       <div class="feature-grid">
-        <div class="mini-panel"><span>♾</span><b>Continuous</b><small>No forced rounds.</small></div>
-        <div class="mini-panel"><span>♥</span><b>Relationships</b><small>People remember you.</small></div>
-        <div class="mini-panel"><span>◇</span><b>Many paths</b><small>Recover after bad choices.</small></div>
+        <article class="mini-panel"><span>∞</span><b>Continuous</b><small>The 45s clock is only the lobby.</small></article>
+        <article class="mini-panel"><span>♥</span><b>Relationships</b><small>Characters react to what you do.</small></article>
+        <article class="mini-panel"><span>◇</span><b>Many paths</b><small>Bad choices can change your route, not erase the world.</small></article>
       </div>
     </section>
 
-    <section id="lobby" class="hidden">
-      <div class="world-hero panel">
-        <div class="status-pill waiting" id="lobbyStatus">JOINING</div>
-        <div class="eyebrow">WORLD</div>
-        <h2 id="lobbyTitle">WHAT HAPPENS?</h2>
-        <div class="join-row"><strong id="lobbyTimer">45</strong><span>seconds to join</span></div>
-        <p class="muted">This timer only opens the lobby. It never controls the story.</p>
-      </div>
-      <div class="panel">
-        <div class="section-head"><div><span class="eyebrow">THE LOBBY</span><h3>Players</h3></div><span id="playerCount" class="count-badge">0</span></div>
-        <div id="lobbyPlayers" class="roster"></div>
-        <button id="joinBtn" class="primary-btn">JOIN WORLD</button>
-        <div id="lobbyHint" class="muted center">You can invite friends outside this group if the owner allows it.</div>
-      </div>
-    </section>
-
-    <section id="game" class="hidden">
-      <div class="world-header panel">
-        <div class="world-title-wrap">
+    <section id="world" class="hidden">
+      <div class="world-head panel">
+        <div>
           <div class="eyebrow">LIVE WORLD</div>
           <h2 id="worldTitle">WHAT HAPPENS?</h2>
-          <div class="world-location"><span id="dimension">The Living City</span><i>•</i><span id="location">Old Market</span></div>
+          <div class="location-line"><span id="dimension">The Unknown</span><i>•</i><span id="location">Somewhere</span></div>
         </div>
-        <div class="live-dot"></div>
+        <span id="worldStatus" class="status-pill live">LIVE</span>
       </div>
 
-      <div class="stat-row">
-        <div><span>CHANCES</span><b id="lifeText">3</b></div>
-        <div><span>HEALTH</span><b id="health">100</b></div>
-        <div><span>ENERGY</span><b id="energy">100</b></div>
-        <div><span>CYCLE</span><b id="cycle">0</b></div>
-      </div>
-      <div class="meter"><span id="healthBar"></span></div>
+      <section id="lobbyPanel" class="panel hidden">
+        <div class="lobby-banner">
+          <div><span class="eyebrow">LOBBY</span><h3>Players are arriving</h3></div>
+          <div class="countdown"><b id="lobbyTimer">45</b><span>sec</span></div>
+        </div>
+        <p class="muted">This timer only controls joining. When it reaches zero, the story begins. If nobody ever joins, this world stays here and can be reopened by /play.</p>
+        <div class="section-head"><div><span class="eyebrow">CONNECTED</span><h3>Players</h3></div><span id="playerCount" class="count-badge">0</span></div>
+        <div id="lobbyPlayers" class="roster"></div>
+      </section>
 
-      <article class="story-card panel">
-        <div class="story-top"><span id="sceneCategory" class="tag">MYSTERY</span><span id="sceneConvergence" class="convergence hidden">PATHS MEET</span></div>
-        <h2 id="sceneTitle">—</h2>
-        <p id="sceneText">—</p>
-        <div id="npcLine" class="npc-line"></div>
-      </article>
+      <section id="pausedPanel" class="panel hidden pause-panel">
+        <div class="pause-icon">Ⅱ</div>
+        <div><span class="eyebrow">WORLD PAUSED</span><h3>The story is waiting.</h3><p class="muted">No progress is deleted. A permitted moderator can resume it at any time.</p></div>
+      </section>
 
-      <section id="choices" class="choices"></section>
+      <section id="storyPanel" class="hidden">
+        <div class="stats">
+          <div><span>CHANCES</span><b id="lifeText">3</b></div>
+          <div><span>HEALTH</span><b id="health">100</b></div>
+          <div><span>ENERGY</span><b id="energy">100</b></div>
+          <div><span>WORLD TURN</span><b id="worldTurn">0</b></div>
+        </div>
+        <div class="meter"><span id="healthBar"></span></div>
 
-      <div class="panel world-memory">
-        <div class="section-head"><div><span class="eyebrow">THE WORLD REMEMBERS</span><h3>People & discoveries</h3></div></div>
+        <article class="story-card panel">
+          <div class="story-top"><span id="sceneCategory" class="tag">STORY</span><span id="sceneConvergence" class="convergence hidden">EVERYONE MEETS</span></div>
+          <h2 id="sceneTitle">—</h2>
+          <p id="sceneText">—</p>
+          <div id="npcLine" class="npc-line"></div>
+        </article>
+        <div id="choices" class="choices"></div>
+      </section>
+
+      <section id="peoplePanel" class="panel hidden">
+        <div class="section-head"><div><span class="eyebrow">THIS WORLD</span><h3>People</h3></div><span id="peopleCount" class="count-badge">0</span></div>
+        <div id="peopleList" class="roster"></div>
+        <div class="eyebrow subhead">YOUR RELATIONSHIPS</div>
         <div id="relationships" class="chips"></div>
+        <div class="eyebrow subhead">DISCOVERED DIMENSIONS</div>
         <div id="discoveries" class="chips"></div>
-        <div class="eyebrow player-list-label">PLAYERS IN THIS WORLD</div>
-        <div id="gamePlayers" class="roster compact"></div>
-      </div>
+      </section>
 
-      <div id="settingsPanel" class="panel hidden">
-        <div class="section-head"><div><span class="eyebrow">OWNER / ADMIN</span><h3>World settings</h3></div></div>
-        <button id="toggleInvites" class="setting-row"><span><b>Friends outside this group</b><small>Allow invite links to join this world.</small></span><strong id="inviteSetting">ON</strong></button>
-      </div>
+      <section id="settingsPanel" class="panel hidden">
+        <div class="section-head"><div><span class="eyebrow">CONTROL</span><h3>World settings</h3></div></div>
+        <button id="toggleInvites" class="setting-row"><span><b>Friends outside the group</b><small>Allow invite links to join this world.</small></span><strong id="inviteSetting">ON</strong></button>
+        <div class="control-grid">
+          <button id="pauseBtn" class="secondary-btn">Pause</button>
+          <button id="resumeBtn" class="secondary-btn">Resume</button>
+        </div>
+        <div id="terminateWrap" class="terminate-wrap hidden">
+          <button id="terminateBtn" class="danger-btn">Terminate this world</button>
+          <small>Only the world creator or bot creator can terminate. Group admins cannot.</small>
+        </div>
+        <div id="operatorWrap" class="operator-wrap hidden">
+          <div class="eyebrow">ASSIGNED OPERATORS</div>
+          <div class="operator-row"><input id="operatorId" inputmode="numeric" placeholder="Telegram user ID"><button id="operatorAdd" class="secondary-btn">Add</button><button id="operatorRemove" class="secondary-btn">Remove</button></div>
+          <small>Operators can pause/resume. They cannot terminate the world.</small>
+        </div>
+      </section>
     </section>
 
     <nav id="bottomNav" class="bottom-nav hidden">
-      <button data-tab="story" class="active">◈<span>Story</span></button>
-      <button data-tab="people">♧<span>Players</span></button>
-      <button data-tab="settings" id="settingsNav">⚙<span>Settings</span></button>
+      <button data-tab="story" class="active"><span>◈</span>Story</button>
+      <button data-tab="people"><span>♧</span>People</button>
+      <button id="settingsNav" data-tab="settings" class="hidden"><span>⚙</span>Control</button>
     </nav>
 
     <div id="toast" class="toast hidden"></div>
