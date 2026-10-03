@@ -3,37 +3,87 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
-  <meta name="theme-color" content="#10141c">
+  <meta name="theme-color" content="#080b12">
+  <meta name="color-scheme" content="dark">
   <title>WHAT HAPPENS?</title>
   <script src="https://telegram.org/js/telegram-web-app.js?63"></script>
   <link rel="stylesheet" href="/app/assets/style.css">
 </head>
 <body>
+  <div class="ambient"></div>
   <main class="app">
     <header class="topbar">
-      <div>
-        <div class="eyebrow">YOUR OWN VISION</div>
-        <h1>WHAT HAPPENS?</h1>
+      <div class="brand">
+        <div class="brand-mark">WH</div>
+        <div>
+          <div class="eyebrow">YOUR OWN VISION</div>
+          <h1>WHAT HAPPENS?</h1>
+        </div>
       </div>
-      <button id="inviteBtn" class="icon-btn" type="button" aria-label="Invite a friend">＋</button>
+      <div class="top-actions">
+        <button id="soundBtn" class="round-btn" type="button" aria-label="Toggle sound">🔊</button>
+        <button id="inviteBtn" class="round-btn" type="button" aria-label="Invite a friend">＋</button>
+      </div>
     </header>
 
-    <section id="statusCard" class="card status-card">
-      <div class="loader"></div>
-      <div>Connecting to your world…</div>
+    <section id="statusCard" class="panel loading-panel">
+      <div class="spinner"></div>
+      <div>
+        <strong>Entering the world…</strong>
+        <div class="muted">Syncing your Telegram session.</div>
+      </div>
     </section>
 
-    <section id="lobby" class="card hidden"></section>
+    <section id="home" class="hidden">
+      <div class="hero panel">
+        <div class="hero-kicker">A LIVING MULTIPLAYER STORY</div>
+        <h2>Your choices change the world.</h2>
+        <p>Explore, build relationships, take risks, recover from failure, and meet other players at shared turning points.</p>
+        <button id="createWorld" class="primary-btn">CREATE A WORLD</button>
+      </div>
+      <div class="feature-grid">
+        <div class="mini-panel"><span>♾</span><b>Continuous</b><small>No forced rounds.</small></div>
+        <div class="mini-panel"><span>♥</span><b>Relationships</b><small>People remember you.</small></div>
+        <div class="mini-panel"><span>◇</span><b>Many paths</b><small>Recover after bad choices.</small></div>
+      </div>
+    </section>
+
+    <section id="lobby" class="hidden">
+      <div class="world-hero panel">
+        <div class="status-pill waiting" id="lobbyStatus">JOINING</div>
+        <div class="eyebrow">WORLD</div>
+        <h2 id="lobbyTitle">WHAT HAPPENS?</h2>
+        <div class="join-row"><strong id="lobbyTimer">45</strong><span>seconds to join</span></div>
+        <p class="muted">This timer only opens the lobby. It never controls the story.</p>
+      </div>
+      <div class="panel">
+        <div class="section-head"><div><span class="eyebrow">THE LOBBY</span><h3>Players</h3></div><span id="playerCount" class="count-badge">0</span></div>
+        <div id="lobbyPlayers" class="roster"></div>
+        <button id="joinBtn" class="primary-btn">JOIN WORLD</button>
+        <div id="lobbyHint" class="muted center">You can invite friends outside this group if the owner allows it.</div>
+      </div>
+    </section>
 
     <section id="game" class="hidden">
-      <div class="world-strip">
-        <div><span class="label">DIMENSION</span><strong id="dimension">—</strong></div>
-        <div><span class="label">LOCATION</span><strong id="location">—</strong></div>
-        <div><span class="label">TURN</span><strong id="turn">0</strong></div>
+      <div class="world-header panel">
+        <div class="world-title-wrap">
+          <div class="eyebrow">LIVE WORLD</div>
+          <h2 id="worldTitle">WHAT HAPPENS?</h2>
+          <div class="world-location"><span id="dimension">The Living City</span><i>•</i><span id="location">Old Market</span></div>
+        </div>
+        <div class="live-dot"></div>
       </div>
 
-      <article class="card scene-card">
-        <div class="scene-meta" id="sceneMeta">—</div>
+      <div class="stat-row">
+        <div><span>CHANCES</span><b id="lifeText">3</b></div>
+        <div><span>HEALTH</span><b id="health">100</b></div>
+        <div><span>ENERGY</span><b id="energy">100</b></div>
+        <div><span>CYCLE</span><b id="cycle">0</b></div>
+      </div>
+      <div class="meter"><span id="healthBar"></span></div>
+
+      <article class="story-card panel">
+        <div class="story-top"><span id="sceneCategory" class="tag">MYSTERY</span><span id="sceneConvergence" class="convergence hidden">PATHS MEET</span></div>
         <h2 id="sceneTitle">—</h2>
         <p id="sceneText">—</p>
         <div id="npcLine" class="npc-line"></div>
@@ -41,23 +91,25 @@
 
       <section id="choices" class="choices"></section>
 
-      <section class="card stats-card">
-        <div class="stats-head"><span>YOUR LIFE</span><span id="lifeText">3 chances</span></div>
-        <div class="meter"><span id="healthBar"></span></div>
-        <div class="stats-grid">
-          <div><span>Health</span><b id="health">100</b></div>
-          <div><span>Energy</span><b id="energy">100</b></div>
-          <div><span>Deaths</span><b id="deaths">0</b></div>
-          <div><span>Cycle</span><b id="cycle">0</b></div>
-        </div>
-        <div id="relationships" class="relationships"></div>
-      </section>
-
-      <section class="card history-card">
-        <div class="section-title">THE WORLD REMEMBERS</div>
+      <div class="panel world-memory">
+        <div class="section-head"><div><span class="eyebrow">THE WORLD REMEMBERS</span><h3>People & discoveries</h3></div></div>
+        <div id="relationships" class="chips"></div>
         <div id="discoveries" class="chips"></div>
-      </section>
+        <div class="eyebrow player-list-label">PLAYERS IN THIS WORLD</div>
+        <div id="gamePlayers" class="roster compact"></div>
+      </div>
+
+      <div id="settingsPanel" class="panel hidden">
+        <div class="section-head"><div><span class="eyebrow">OWNER / ADMIN</span><h3>World settings</h3></div></div>
+        <button id="toggleInvites" class="setting-row"><span><b>Friends outside this group</b><small>Allow invite links to join this world.</small></span><strong id="inviteSetting">ON</strong></button>
+      </div>
     </section>
+
+    <nav id="bottomNav" class="bottom-nav hidden">
+      <button data-tab="story" class="active">◈<span>Story</span></button>
+      <button data-tab="people">♧<span>Players</span></button>
+      <button data-tab="settings" id="settingsNav">⚙<span>Settings</span></button>
+    </nav>
 
     <div id="toast" class="toast hidden"></div>
   </main>
