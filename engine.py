@@ -14,7 +14,7 @@ class EngineEvent:
 
 
 class EngineResult(dict):
-    """Dict-compatible result used by game_service.py."""
+    """Dict-compatible deterministic engine result."""
 
     def __init__(
         self,
@@ -45,23 +45,20 @@ class EngineResult(dict):
 
 class GameEngine:
     """
-    Deterministic gameplay engine for WHAT HAPPENS?
+    Deterministic gameplay engine.
 
-    No Telegram, Gemini, or Supabase calls belong here.
-    The service/database layer owns persistence and networking.
-
-    This implementation deliberately accepts both:
-      - normal scene choices with next_scene_id/next_scene
-      - terminal choices with ending_id/ending
-      - scenes marked is_ending=True
-
-    That prevents the previous crash:
-        Choice '...' has no target.
+    Critical rules:
+    - every normal choice must have a valid target;
+    - all active players' decisions participate in a round;
+    - a newly entered scene is NOT auto-finished in the same round;
+    - terminal choices explicitly finish the game;
+    - a timeout with no human decision still advances deterministically;
+    - NPCs can continue making deterministic choices;
+    - no Telegram/Gemini/Supabase code belongs here.
     """
 
     MIN_TIMER_SECONDS = 10
     MAX_TIMER_SECONDS = 3600
-    MAX_MISSED_DECISIONS = 3
 
     PLAYER_STATUSES = {
         "pending",
@@ -76,7 +73,6 @@ class GameEngine:
             raise ValueError("Story must be an object.")
 
         self.story = copy.deepcopy(story)
-
         roles = self.story.get("roles", [])
         scenes = self.story.get("scenes", [])
 
@@ -87,10 +83,13 @@ class GameEngine:
 
         self.roles = self._index_list(roles, "role")
         self.scenes = self._index_list(scenes, "scene")
-        self.characters = self._index_characters()
-        self.endings = self._index_endings()
+        self.characters = self._index_list(
+            self.story.get("characters", self.story.get("playable_characters", [])) or [],
+            "character",
+        )
+        self.endings = self._index_endings(self.story.get("endings", []))
 
-        # Compatibility with the previous engine/game_service code.
+        # Compatibility aliases used by the existing application.
         self._roles = self.roles
         self._scenes = self.scenes
         self._characters = self.characters
@@ -98,22 +97,23 @@ class GameEngine:
 
         self.validate_story()
 
-    # ============================================================
-    # BASIC HELPERS
-    # ============================================================
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def _deepcopy(value: Any) -> Any:
-        return copy.deepcopy(value)
-
-    @staticmethod
-    def _require_string(value: Any, field_name: str) -> str:
+    def _as_bool(value: Any, default: bool = False) -> bool:
         if value is None:
-            raise ValueError(f"Missing required field: {field_name}")
-        result = str(value).strip()
-        if not result:
-            raise ValueError(f"Field '{field_name}' cannot be empty.")
-        return result
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            value = value.strip().lower()
+            if value in {"true", "1", "yes", "y"}:
+                return True
+            if value in {"false", "0", "no", "n"}:
+                return False
+        return bool(value)
 
     @staticmethod
     def _as_int(
@@ -133,28 +133,13 @@ class GameEngine:
             raise ValueError(f"{field_name} must be an integer.") from exc
 
     @staticmethod
-    def _as_bool(value: Any, default: bool = False) -> bool:
+    def _require_string(value: Any, field_name: str) -> str:
         if value is None:
-            return default
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            value = value.strip().lower()
-            if value in {"true", "1", "yes", "y"}:
-                return True
-            if value in {"false", "0", "no", "n"}:
-                return False
-        return bool(value)
-
-    @staticmethod
-    def _fingerprint(value: Any) -> str:
-        raw = json.dumps(
-            value,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode("utf-8")
-        return hashlib.sha256(raw).hexdigest()
+            raise ValueError(f"Missing required field: {field_name}")
+        result = str(value).strip()
+        if not result:
+            raise ValueError(f"Field '{field_name}' cannot be empty.")
+        return result
 
     @classmethod
     def _index_list(
@@ -162,8 +147,10 @@ class GameEngine:
         values: Any,
         name: str,
     ) -> dict[str, dict[str, Any]]:
-        result: dict[str, dict[str, Any]] = {}
+        if not isinstance(values, list):
+            raise ValueError(f"{name}s must be a list.")
 
+        result: dict[str, dict[str, Any]] = {}
         for raw in values:
             if not isinstance(raw, dict):
                 raise ValueError(f"Every {name} must be an object.")
@@ -180,47 +167,48 @@ class GameEngine:
 
         return result
 
-    def _index_characters(self) -> dict[str, dict[str, Any]]:
-        values = self.story.get("characters")
-        if values is None:
-            values = self.story.get("playable_characters", [])
-        return self._index_list(values or [], "character")
-
-    def _index_endings(self) -> dict[str, dict[str, Any]]:
-        endings = self.story.get("endings", [])
-        result: dict[str, dict[str, Any]] = {}
-
-        if isinstance(endings, dict):
-            for key, raw in endings.items():
-                if not isinstance(raw, dict):
+    @classmethod
+    def _index_endings(cls, values: Any) -> dict[str, dict[str, Any]]:
+        if isinstance(values, dict):
+            iterable: list[dict[str, Any]] = []
+            for key, value in values.items():
+                if not isinstance(value, dict):
                     raise ValueError("Every ending must be an object.")
-                item = copy.deepcopy(raw)
+                item = copy.deepcopy(value)
                 item.setdefault("id", str(key))
-                ending_id = self._require_string(
-                    item.get("id"),
-                    "ending.id",
-                )
-                if ending_id in result:
-                    raise ValueError(f"Duplicate ending id: {ending_id}")
-                result[ending_id] = item
-            return result
-
-        if not isinstance(endings, list):
+                iterable.append(item)
+        elif isinstance(values, list):
+            iterable = values
+        else:
             raise ValueError("endings must be a list or object.")
 
-        for raw in endings:
+        result: dict[str, dict[str, Any]] = {}
+        for raw in iterable:
             if not isinstance(raw, dict):
                 raise ValueError("Every ending must be an object.")
-            ending_id = self._require_string(raw.get("id"), "ending.id")
+
+            ending_id = cls._require_string(raw.get("id"), "ending.id")
+
             if ending_id in result:
                 raise ValueError(f"Duplicate ending id: {ending_id}")
+
             result[ending_id] = copy.deepcopy(raw)
 
         return result
 
-    # ============================================================
-    # STORY API
-    # ============================================================
+    @staticmethod
+    def _fingerprint(value: Any) -> str:
+        raw = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
+
+    # ------------------------------------------------------------------
+    # Story API
+    # ------------------------------------------------------------------
 
     def story_fingerprint(self) -> str:
         return self._fingerprint(self.story)
@@ -254,29 +242,24 @@ class GameEngine:
             raise ValueError(f"Unknown ending: {ending_id}") from exc
 
     def first_scene_id(self) -> str:
-        return self.get_first_scene_id()
-
-    def get_first_scene_id(self) -> str:
-        first = self.story.get(
+        value = self.story.get(
             "first_scene_id",
             self.story.get("first_scene"),
         )
-        first = self._require_string(first, "first_scene_id")
+        value = self._require_string(value, "first_scene_id")
 
-        if first not in self._scenes:
-            raise ValueError(f"First scene does not exist: {first}")
+        if value not in self._scenes:
+            raise ValueError(f"First scene does not exist: {value}")
 
-        return first
+        return value
+
+    get_first_scene_id = first_scene_id
 
     def initial_world_state(self) -> dict[str, Any]:
         value = self.story.get("initial_world_state", {})
         if not isinstance(value, dict):
             raise ValueError("initial_world_state must be an object.")
         return copy.deepcopy(value)
-
-    # ============================================================
-    # ROLES / PLAYERS
-    # ============================================================
 
     def playable_roles(self) -> list[dict[str, Any]]:
         return [
@@ -290,16 +273,6 @@ class GameEngine:
 
     def playable_role_ids(self) -> list[str]:
         return [role["id"] for role in self.playable_roles()]
-
-    def playable_character_ids(self) -> list[str]:
-        return [
-            key
-            for key, value in self._characters.items()
-            if self._as_bool(
-                value.get("playable", value.get("is_playable", True)),
-                True,
-            )
-        ]
 
     def validate_player_count(self, player_count: int) -> None:
         player_count = self._as_int(player_count, "player_count")
@@ -338,51 +311,113 @@ class GameEngine:
                 "Player count exceeds available playable roles."
             )
 
-    def validate_role_assignments(
-        self,
-        players: Iterable[dict[str, Any]],
-    ) -> None:
-        seen: set[str] = set()
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
 
-        for player in players:
-            role_id = player.get("role_id")
-            if role_id is None:
-                continue
+    @staticmethod
+    def _scene_choices(scene: dict[str, Any]) -> list[dict[str, Any]]:
+        choices = scene.get("choices", [])
 
-            role_id = self._require_string(
-                role_id,
-                "player.role_id",
-            )
+        if not isinstance(choices, list):
+            raise ValueError("Scene choices must be a list.")
 
-            role = self.get_role(role_id)
+        return [
+            choice
+            for choice in choices
+            if isinstance(choice, dict)
+        ]
 
-            if not self._as_bool(
-                role.get("playable", role.get("is_playable", True)),
-                True,
-            ):
-                raise ValueError(f"Role '{role_id}' is not playable.")
+    @staticmethod
+    def _choice_target(choice: dict[str, Any]) -> str | None:
+        for key in (
+            "next_scene_id",
+            "next_scene",
+            "target_scene_id",
+            "target_scene",
+            "ending_id",
+            "ending",
+        ):
+            value = choice.get(key)
 
-            if role_id in seen:
-                raise ValueError(
-                    f"Role '{role_id}' has been assigned more than once."
-                )
+            if isinstance(value, dict):
+                value = value.get("id")
 
-            seen.add(role_id)
+            if value is not None:
+                text = str(value).strip()
+                if text:
+                    return text
 
-    # ============================================================
-    # VALIDATION
-    # ============================================================
+        return None
+
+    @staticmethod
+    def _choice_ending_id(choice: dict[str, Any]) -> str | None:
+        value = choice.get(
+            "ending_id",
+            choice.get("ending"),
+        )
+
+        if isinstance(value, dict):
+            value = value.get("id")
+
+        if value is None:
+            return None
+
+        text = str(value).strip()
+        return text or None
+
+    @staticmethod
+    def _choice_is_terminal(choice: dict[str, Any]) -> bool:
+        return GameEngine._as_bool(
+            choice.get(
+                "ends_game",
+                choice.get(
+                    "terminal",
+                    choice.get("is_terminal", False),
+                ),
+            ),
+            False,
+        )
+
+    @staticmethod
+    def _scene_ending_id(scene: dict[str, Any]) -> str | None:
+        value = scene.get(
+            "ending_id",
+            scene.get("ending"),
+        )
+
+        if isinstance(value, dict):
+            value = value.get("id")
+
+        if value is not None:
+            text = str(value).strip()
+            return text or None
+
+        if GameEngine._as_bool(
+            scene.get("is_ending", False),
+            False,
+        ):
+            return str(scene.get("id", "")).strip() or None
+
+        return None
 
     def validate_story(self) -> None:
         if not self._roles:
             raise ValueError("Story must contain at least one role.")
+
         if not self._scenes:
             raise ValueError("Story must contain at least one scene.")
 
-        self.get_first_scene_id()
+        self.first_scene_id()
 
         for scene_id, scene in self._scenes.items():
             choices = self._scene_choices(scene)
+
+            if not choices:
+                raise ValueError(
+                    f"Scene '{scene_id}' has no choices."
+                )
+
             seen: set[str] = set()
 
             for choice in choices:
@@ -395,27 +430,23 @@ class GameEngine:
                     raise ValueError(
                         f"Duplicate choice '{choice_id}' in scene '{scene_id}'."
                     )
+
                 seen.add(choice_id)
 
-                # A choice is allowed to terminate the game.
-                # ending_id/ending is a valid target.
                 target = self._choice_target(choice)
 
-                if not target:
-                    # Some generated stories use:
-                    # {"ends_game": true}
-                    # or {"terminal": true}.
-                    # Treat these as terminal choices and normalize them.
-                    if self._choice_is_terminal(choice):
-                        continue
-
+                if (
+                    not target
+                    and not self._choice_is_terminal(choice)
+                ):
                     raise ValueError(
                         f"Choice '{choice_id}' in scene '{scene_id}' "
                         "has no target."
                     )
 
                 if (
-                    target not in self._scenes
+                    target
+                    and target not in self._scenes
                     and target not in self._endings
                 ):
                     raise ValueError(
@@ -443,6 +474,7 @@ class GameEngine:
 
     def _validate_timer(self, value: Any, label: str) -> int:
         seconds = self._as_int(value, label)
+
         if not (
             self.MIN_TIMER_SECONDS
             <= seconds
@@ -453,96 +485,8 @@ class GameEngine:
                 f"{self.MIN_TIMER_SECONDS} and "
                 f"{self.MAX_TIMER_SECONDS} seconds."
             )
+
         return seconds
-
-    # ============================================================
-    # SCENES / CHOICES
-    # ============================================================
-
-    @staticmethod
-    def _scene_choices(scene: dict[str, Any]) -> list[dict[str, Any]]:
-        choices = scene.get("choices", [])
-        if not isinstance(choices, list):
-            raise ValueError("Scene choices must be a list.")
-        return [
-            choice
-            for choice in choices
-            if isinstance(choice, dict)
-        ]
-
-    @staticmethod
-    def _choice_target(choice: dict[str, Any]) -> str | None:
-        for key in (
-            "next_scene_id",
-            "next_scene",
-            "target_scene_id",
-            "target_scene",
-            "ending_id",
-            "ending",
-        ):
-            value = choice.get(key)
-
-            if isinstance(value, dict):
-                value = value.get("id")
-
-            if value is not None:
-                result = str(value).strip()
-                if result:
-                    return result
-
-        return None
-
-    @staticmethod
-    def _choice_is_terminal(choice: dict[str, Any]) -> bool:
-        return GameEngine._as_bool(
-            choice.get(
-                "ends_game",
-                choice.get(
-                    "terminal",
-                    choice.get(
-                        "is_terminal",
-                        False,
-                    ),
-                ),
-            ),
-            False,
-        )
-
-    @staticmethod
-    def _choice_ending_id(choice: dict[str, Any]) -> str | None:
-        value = choice.get(
-            "ending_id",
-            choice.get("ending"),
-        )
-
-        if isinstance(value, dict):
-            value = value.get("id")
-
-        if value is None:
-            return None
-
-        value = str(value).strip()
-        return value or None
-
-    @staticmethod
-    def _scene_ending_id(scene: dict[str, Any]) -> str | None:
-        value = scene.get(
-            "ending_id",
-            scene.get("ending"),
-        )
-
-        if isinstance(value, dict):
-            value = value.get("id")
-
-        if value is not None:
-            value = str(value).strip()
-            return value or None
-
-        if GameEngine._as_bool(scene.get("is_ending"), False):
-            scene_id = str(scene.get("id", "")).strip()
-            return scene_id or None
-
-        return None
 
     def timer_seconds(self, scene: dict[str, Any]) -> int:
         value = scene.get(
@@ -553,28 +497,14 @@ class GameEngine:
         if value is None:
             value = self.story.get(
                 "timer_seconds",
-                self.story.get("decision_timer_seconds", 60),
+                self.story.get("decision_timer_seconds", 45),
             )
 
         return self._validate_timer(value, "scene")
 
-    def enter_scene(
-        self,
-        world_state: dict[str, Any],
-        scene_id: str,
-    ) -> dict[str, Any]:
-        self.get_scene(scene_id)
-
-        if not isinstance(world_state, dict):
-            raise ValueError("world_state must be an object.")
-
-        result = copy.deepcopy(world_state)
-        result["scene_id"] = scene_id
-        return result
-
-    # ============================================================
-    # CONDITIONS
-    # ============================================================
+    # ------------------------------------------------------------------
+    # Conditions / choices
+    # ------------------------------------------------------------------
 
     def _lookup_condition_value(
         self,
@@ -599,11 +529,11 @@ class GameEngine:
         if condition_type == "knowledge":
             knowledge = state.get("knowledge", [])
 
-            if isinstance(knowledge, dict):
-                return knowledge.get(str(key))
-
             if isinstance(knowledge, list):
                 return key in knowledge
+
+            if isinstance(knowledge, dict):
+                return knowledge.get(str(key))
 
             return None
 
@@ -662,6 +592,7 @@ class GameEngine:
                 state,
                 condition,
             )
+
             expected = condition.get("value")
             operator = str(
                 condition.get("operator", "eq")
@@ -676,217 +607,6 @@ class GameEngine:
 
         return True
 
-    # ============================================================
-    # EFFECTS
-    # ============================================================
-
-    def _apply_effects(
-        self,
-        state: dict[str, Any],
-        choice: dict[str, Any],
-    ) -> None:
-        effects = choice.get("effects") or {}
-
-        if not isinstance(effects, dict):
-            return
-
-        flags = state.setdefault("flags", {})
-        variables = state.setdefault("variables", {})
-        relationships = state.setdefault("relationships", {})
-        knowledge = state.setdefault("knowledge", [])
-
-        for key, value in (effects.get("set_flags") or {}).items():
-            flags[str(key)] = value
-
-        for key in effects.get("remove_flags") or []:
-            flags.pop(str(key), None)
-
-        for key, value in (effects.get("set_variables") or {}).items():
-            variables[str(key)] = value
-
-        for key, value in (effects.get("add_variables") or {}).items():
-            old = variables.get(str(key), 0)
-            try:
-                variables[str(key)] = old + value
-            except TypeError:
-                variables[str(key)] = value
-
-        relationship_effects = effects.get("relationships") or []
-
-        if isinstance(relationship_effects, dict):
-            relationship_effects = [relationship_effects]
-
-        for relationship in relationship_effects:
-            if not isinstance(relationship, dict):
-                continue
-
-            source = relationship.get(
-                "from",
-                relationship.get("source"),
-            )
-            target = relationship.get(
-                "to",
-                relationship.get("target"),
-            )
-
-            key = (
-                f"{source}:{target}"
-                if source is not None and target is not None
-                else str(relationship.get("key", ""))
-            )
-
-            if not key:
-                continue
-
-            if relationship.get("set") is not None:
-                relationships[key] = relationship["set"]
-                continue
-
-            delta = relationship.get(
-                "change",
-                relationship.get(
-                    "delta",
-                    relationship.get("value", 0),
-                ),
-            )
-
-            try:
-                relationships[key] = (
-                    relationships.get(key, 0) + delta
-                )
-            except TypeError:
-                relationships[key] = delta
-
-        for item in effects.get("knowledge") or []:
-            if item not in knowledge:
-                knowledge.append(item)
-
-        if effects.get("character_state") is not None:
-            state["character_state"] = copy.deepcopy(
-                effects["character_state"]
-            )
-
-        if effects.get("text") is not None:
-            state["last_effect_text"] = effects["text"]
-        elif effects.get("description") is not None:
-            state["last_effect_text"] = effects["description"]
-
-    # ============================================================
-    # INITIAL STATE
-    # ============================================================
-
-    def create_initial_state(
-        self,
-        players: Iterable[dict[str, Any]],
-    ) -> dict[str, Any]:
-        player_list = [
-            copy.deepcopy(player)
-            for player in players
-        ]
-
-        if not player_list:
-            raise ValueError("At least one player is required.")
-
-        self.validate_player_count(len(player_list))
-        self.validate_role_assignments(player_list)
-
-        seen: set[str] = set()
-        normalized: list[dict[str, Any]] = []
-
-        for player in player_list:
-            user_id = self._require_string(
-                player.get("user_id"),
-                "player.user_id",
-            )
-
-            if user_id in seen:
-                raise ValueError(
-                    f"Duplicate player user_id: {user_id}"
-                )
-
-            seen.add(user_id)
-
-            status = player.get("status", "active")
-
-            if status not in self.PLAYER_STATUSES:
-                raise ValueError(
-                    f"Invalid player status '{status}' for {user_id}."
-                )
-
-            normalized.append(
-                {
-                    **player,
-                    "user_id": user_id,
-                    "status": status,
-                    "missed_decisions": self._as_int(
-                        player.get("missed_decisions", 0),
-                        "player.missed_decisions",
-                    ),
-                    "last_decision_round": player.get(
-                        "last_decision_round"
-                    ),
-                    "last_choice_id": player.get(
-                        "last_choice_id"
-                    ),
-                }
-            )
-
-        return {
-            "status": "active",
-            "round_number": 1,
-            "scene_id": self.first_scene_id(),
-            "players": normalized,
-            "world_state": self.initial_world_state(),
-            "relationships": copy.deepcopy(
-                self.story.get("initial_relationships", {})
-            ),
-            "flags": copy.deepcopy(
-                self.story.get("initial_flags", {})
-            ),
-            "variables": copy.deepcopy(
-                self.story.get("initial_variables", {})
-            ),
-            "knowledge": copy.deepcopy(
-                self.story.get("initial_knowledge", [])
-            ),
-            "history": [],
-            "ending_id": None,
-            "story_fingerprint": self.story_fingerprint(),
-        }
-
-    # ============================================================
-    # PLAYER HELPERS
-    # ============================================================
-
-    def _find_player(
-        self,
-        state: dict[str, Any],
-        user_id: str,
-    ) -> tuple[int, dict[str, Any]]:
-        uid = str(user_id)
-
-        for index, player in enumerate(
-            state.get("players", [])
-        ):
-            if str(player.get("user_id")) == uid:
-                return index, player
-
-        raise ValueError(f"Unknown player: {uid}")
-
-    def active_players(
-        self,
-        state: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        return [
-            player
-            for player in state.get("players", [])
-            if player.get("status", "active") == "active"
-        ]
-
-    # ============================================================
-    # ROLE UI / CHOICES
-    # ============================================================
-
     def choices_for_role(
         self,
         scene: dict[str, Any],
@@ -894,28 +614,36 @@ class GameEngine:
         world_state: dict[str, Any],
     ) -> list[dict[str, Any]]:
         state = {
-            "world_state": copy.deepcopy(world_state),
             "flags": (
-                world_state.get("flags", {})
+                copy.deepcopy(world_state.get("flags", {}))
                 if isinstance(world_state, dict)
                 else {}
             ),
             "variables": (
-                world_state.get("variables", {})
+                copy.deepcopy(world_state.get("variables", {}))
                 if isinstance(world_state, dict)
                 else {}
             ),
             "relationships": (
-                world_state.get("relationships", {})
+                copy.deepcopy(world_state.get("relationships", {}))
                 if isinstance(world_state, dict)
                 else {}
             ),
             "knowledge": (
-                world_state.get("knowledge", [])
+                copy.deepcopy(world_state.get("knowledge", []))
                 if isinstance(world_state, dict)
                 else []
             ),
         }
+
+        eligible_roles = scene.get("eligible_roles")
+
+        if (
+            isinstance(eligible_roles, list)
+            and eligible_roles
+            and str(role_id) not in {str(value) for value in eligible_roles}
+        ):
+            return []
 
         return [
             copy.deepcopy(choice)
@@ -949,439 +677,129 @@ class GameEngine:
             f"in scene '{scene.get('id')}'."
         )
 
-    # ============================================================
-    # DECISION VALIDATION
-    # ============================================================
+    # ------------------------------------------------------------------
+    # World state
+    # ------------------------------------------------------------------
 
-    def validate_decision(
+    def enter_scene(
         self,
-        state: dict[str, Any],
-        user_id: str,
-        choice_id: str,
-        *,
-        scene: dict[str, Any] | None = None,
+        world_state: dict[str, Any],
+        scene_id: str,
     ) -> dict[str, Any]:
-        _, player = self._find_player(
-            state,
-            user_id,
-        )
+        self.get_scene(scene_id)
 
-        if player.get("status", "active") != "active":
-            raise ValueError("Player is not active.")
+        if not isinstance(world_state, dict):
+            raise ValueError("world_state must be an object.")
 
-        current_round = self._as_int(
-            state.get("round_number", 1),
-            "state.round_number",
-        )
+        result = copy.deepcopy(world_state)
+        result["scene_id"] = scene_id
+        return result
 
-        if player.get("last_decision_round") == current_round:
-            raise ValueError(
-                "Player has already submitted a decision for this round."
-            )
-
-        scene = scene or self.get_scene(
-            state.get("scene_id")
-        )
-
-        for choice in self._scene_choices(scene):
-            if (
-                str(choice.get("id", "")).strip()
-                == str(choice_id).strip()
-            ):
-                if not self._conditions_met(
-                    state,
-                    choice.get("conditions", []),
-                ):
-                    raise ValueError(
-                        "This choice is not currently available."
-                    )
-
-                return copy.deepcopy(choice)
-
-        raise ValueError(
-            f"Choice '{choice_id}' is not available "
-            f"in scene '{scene.get('id')}'."
-        )
-
-    # ============================================================
-    # SCENE TRANSITIONS
-    # ============================================================
-
-    @staticmethod
-    def _automatic_scene_target(
-        scene: dict[str, Any],
-    ) -> str | None:
-        for key in (
-            "next_scene_id",
-            "next_scene",
-            "target_scene_id",
-            "target_scene",
-        ):
-            value = scene.get(key)
-
-            if isinstance(value, dict):
-                value = value.get("id")
-
-            if value is not None:
-                result = str(value).strip()
-                if result:
-                    return result
-
-        return None
-
-    def _transition_scene(
+    def _apply_effects(
         self,
         state: dict[str, Any],
-        target_scene: str,
-        events: list[EngineEvent],
+        choice: dict[str, Any],
     ) -> None:
-        target_scene = self._require_string(
-            target_scene,
-            "target_scene",
-        )
+        effects = choice.get("effects") or {}
 
-        if target_scene not in self._scenes:
-            raise ValueError(
-                f"Cannot transition to unknown scene '{target_scene}'."
-            )
+        if not isinstance(effects, dict):
+            return
 
-        old_scene = state.get("scene_id")
-        state["scene_id"] = target_scene
+        flags = state.setdefault("flags", {})
+        variables = state.setdefault("variables", {})
+        relationships = state.setdefault("relationships", {})
+        knowledge = state.setdefault("knowledge", [])
 
-        events.append(
-            EngineEvent(
-                "scene_transition",
-                {
-                    "from_scene": old_scene,
-                    "to_scene": target_scene,
-                },
-            )
-        )
+        for key, value in (effects.get("set_flags") or {}).items():
+            flags[str(key)] = value
 
-    # ============================================================
-    # GAME ENDING
-    # ============================================================
+        for key in effects.get("remove_flags") or []:
+            flags.pop(str(key), None)
 
-    def _finish_game(
-        self,
-        state: dict[str, Any],
-        ending_id: str,
-        events: list[EngineEvent],
-    ) -> None:
-        ending_id = self._require_string(
-            ending_id,
-            "ending_id",
-        )
+        for key, value in (effects.get("set_variables") or {}).items():
+            variables[str(key)] = value
 
-        if ending_id not in self._endings:
-            raise ValueError(
-                f"Unknown ending: {ending_id}"
-            )
-
-        state["status"] = "finished"
-        state["ending_id"] = ending_id
-
-        ending = self._endings[ending_id]
-
-        if isinstance(ending, dict):
-            text = ending.get(
-                "text",
-                ending.get(
-                    "description",
-                ),
-            )
-            if text is not None:
-                state["ending_text"] = str(text)
-
-        events.append(
-            EngineEvent(
-                "game_finished",
-                {
-                    "ending_id": ending_id,
-                },
-            )
-        )
-
-    # ============================================================
-    # ROUND RESOLUTION
-    # ============================================================
-
-    def resolve_round(
-        self,
-        state: dict[str, Any] | None = None,
-        decisions: Iterable[dict[str, Any]] | None = None,
-        *,
-        scene_id: str | None = None,
-        round_number: int | None = None,
-        world_state: dict[str, Any] | None = None,
-        players: Iterable[dict[str, Any]] | None = None,
-    ) -> EngineResult:
-        """
-        Supports both APIs:
-
-        resolve_round(state, decisions)
-
-        and:
-
-        resolve_round(
-            scene_id=...,
-            round_number=...,
-            world_state=...,
-            players=...,
-            decisions=...,
-        )
-        """
-
-        if state is None:
-            if scene_id is None or round_number is None:
-                raise ValueError(
-                    "state or scene_id/round_number is required."
+        for key, value in (effects.get("add_variables") or {}).items():
+            try:
+                variables[str(key)] = (
+                    variables.get(str(key), 0) + value
                 )
+            except TypeError:
+                variables[str(key)] = value
 
-            supplied_world = copy.deepcopy(world_state or {})
+        relationships_data = effects.get("relationships") or []
 
-            state = {
-                "status": "active",
-                "round_number": int(round_number),
-                "scene_id": str(scene_id),
-                "players": copy.deepcopy(list(players or [])),
-                "world_state": supplied_world,
-                "flags": copy.deepcopy(
-                    supplied_world.get("flags", {})
-                ),
-                "variables": copy.deepcopy(
-                    supplied_world.get("variables", {})
-                ),
-                "relationships": copy.deepcopy(
-                    supplied_world.get("relationships", {})
-                ),
-                "knowledge": copy.deepcopy(
-                    supplied_world.get("knowledge", [])
-                ),
-                "history": [],
-                "ending_id": None,
-            }
-        else:
-            state = copy.deepcopy(state)
+        if isinstance(relationships_data, dict):
+            relationships_data = [relationships_data]
 
-        decisions_list = list(decisions or [])
-
-        current_round = self._as_int(
-            state.get("round_number", 1),
-            "state.round_number",
-        )
-
-        decision_map = {
-            str(decision.get("user_id")): decision
-            for decision in decisions_list
-            if isinstance(decision, dict)
-        }
-
-        missed_results: list[dict[str, Any]] = []
-        events: list[EngineEvent] = []
-
-        # Process each active player's decision.
-        for player in state.get("players", []):
-            if player.get("status", "active") != "active":
+        for relationship in relationships_data:
+            if not isinstance(relationship, dict):
                 continue
 
-            user_id = str(player.get("user_id"))
-            decision = decision_map.get(user_id)
+            source = relationship.get(
+                "from",
+                relationship.get("source"),
+            )
+            target = relationship.get(
+                "to",
+                relationship.get("target"),
+            )
 
-            if decision is None:
-                missed = (
-                    self._as_int(
-                        player.get("missed_decisions", 0),
-                        "player.missed_decisions",
-                    )
-                    + 1
-                )
+            key = (
+                f"{source}:{target}"
+                if source is not None and target is not None
+                else str(relationship.get("key", ""))
+            )
 
-                player["missed_decisions"] = missed
-
-                missed_results.append(
-                    {
-                        "user_id": user_id,
-                        "missed_decisions": missed,
-                    }
-                )
-
-                # Do not automatically kill a player unless the
-                # service explicitly wants that behavior. Preserve
-                # the original MAX_MISSED_DECISIONS policy by
-                # marking the player after the configured threshold.
-                if missed >= self.MAX_MISSED_DECISIONS:
-                    player["status"] = "eliminated"
-
-                    events.append(
-                        EngineEvent(
-                            "player_eliminated",
-                            {
-                                "user_id": user_id,
-                                "reason": "missed_decisions",
-                            },
-                        )
-                    )
-
+            if not key:
                 continue
 
-            choice_id = self._require_string(
-                decision.get("choice_id"),
-                "decision.choice_id",
-            )
-
-            scene = self.get_scene(
-                state["scene_id"]
-            )
-
-            choice = self.validate_decision(
-                state,
-                user_id,
-                choice_id,
-                scene=scene,
-            )
-
-            self._apply_effects(
-                state,
-                choice,
-            )
-
-            player["last_choice_id"] = choice_id
-            player["last_decision_round"] = current_round
-            player["missed_decisions"] = 0
-
-            events.append(
-                EngineEvent(
-                    "round_decision_applied",
-                    {
-                        "round_number": current_round,
-                        "user_id": user_id,
-                        "choice_id": choice_id,
-                    },
-                )
-            )
-
-            ending = self._choice_ending_id(choice)
-            target = self._choice_target(choice)
-
-            # Terminal choice with an explicit ending.
-            if ending:
-                self._finish_game(
-                    state,
-                    ending,
-                    events,
-                )
-                break
-
-            # Terminal choice without an ending id:
-            # use a generated fallback ending id.
-            if (
-                not target
-                and self._choice_is_terminal(choice)
-            ):
-                fallback_ending = self._ensure_terminal_choice_ending(
-                    choice
-                )
-                self._finish_game(
-                    state,
-                    fallback_ending,
-                    events,
-                )
-                break
-
-            # Target points to an ending.
-            if target in self._endings:
-                self._finish_game(
-                    state,
-                    target,
-                    events,
-                )
-                break
-
-            # Target points to another scene.
-            if target:
-                self._transition_scene(
-                    state,
-                    target,
-                    events,
-                )
-                break
-
-        # Resolve automatic scene endings/transitions.
-        if state.get("status") != "finished":
-            scene = self.get_scene(
-                state["scene_id"]
-            )
-
-            scene_ending = self._scene_ending_id(scene)
-
-            if scene_ending:
-                self._finish_game(
-                    state,
-                    scene_ending,
-                    events,
-                )
+            if relationship.get("set") is not None:
+                relationships[key] = relationship["set"]
             else:
-                automatic_target = self._automatic_scene_target(scene)
+                delta = relationship.get(
+                    "change",
+                    relationship.get(
+                        "delta",
+                        relationship.get("value", 0),
+                    ),
+                )
 
-                if automatic_target:
-                    if automatic_target in self._endings:
-                        self._finish_game(
-                            state,
-                            automatic_target,
-                            events,
-                        )
-                    else:
-                        self._transition_scene(
-                            state,
-                            automatic_target,
-                            events,
-                        )
-                else:
-                    state["round_number"] = current_round + 1
+                try:
+                    relationships[key] = (
+                        relationships.get(key, 0) + delta
+                    )
+                except TypeError:
+                    relationships[key] = delta
 
-        # Keep database-facing world_state synchronized.
-        state["world_state"] = copy.deepcopy(
-            state.get("world_state", {})
-        )
-        state["world_state"]["flags"] = copy.deepcopy(
-            state.get("flags", {})
-        )
-        state["world_state"]["variables"] = copy.deepcopy(
-            state.get("variables", {})
-        )
-        state["world_state"]["relationships"] = copy.deepcopy(
-            state.get("relationships", {})
-        )
-        state["world_state"]["knowledge"] = copy.deepcopy(
-            state.get("knowledge", [])
-        )
+        for item in effects.get("knowledge") or []:
+            value = (
+                item.get("knowledge")
+                if isinstance(item, dict)
+                else item
+            )
 
-        state.setdefault("history", []).append(
-            {
-                "round_number": current_round,
-                "decisions": copy.deepcopy(decisions_list),
-                "missed_results": copy.deepcopy(missed_results),
-                "scene_id": state.get("scene_id"),
-                "ending_id": state.get("ending_id"),
-            }
-        )
+            if value and value not in knowledge:
+                knowledge.append(value)
 
-        return EngineResult(
-            state=state,
-            events=events,
-            changed=True,
-            missed_results=missed_results,
-        )
+        if effects.get("character_state") is not None:
+            state["character_state"] = copy.deepcopy(
+                effects["character_state"]
+            )
 
-    def _ensure_terminal_choice_ending(
+        if effects.get("text") is not None:
+            state["last_effect_text"] = effects["text"]
+        elif effects.get("description") is not None:
+            state["last_effect_text"] = effects["description"]
+
+    # ------------------------------------------------------------------
+    # Resolution
+    # ------------------------------------------------------------------
+
+    def _ensure_terminal_ending(
         self,
         choice: dict[str, Any],
     ) -> str:
-        """
-        Convert a terminal choice with no ending_id into a stable
-        ending object. This makes older/local fallback stories safe.
-        """
         choice_id = str(
             choice.get("id", "terminal")
         ).strip()
@@ -1405,13 +823,564 @@ class GameEngine:
                         ),
                     ),
                 ),
+                "conditions": [],
             }
 
         return ending_id
 
-    # ============================================================
-    # SERIALIZATION HELPERS
-    # ============================================================
+    def _finish_game(
+        self,
+        state: dict[str, Any],
+        ending_id: str,
+        events: list[EngineEvent],
+    ) -> None:
+        ending_id = self._require_string(
+            ending_id,
+            "ending_id",
+        )
+
+        if ending_id not in self._endings:
+            raise ValueError(
+                f"Unknown ending: {ending_id}"
+            )
+
+        state["status"] = "finished"
+        state["ending_id"] = ending_id
+
+        ending = self._endings[ending_id]
+
+        state["ending_text"] = str(
+            ending.get(
+                "text",
+                ending.get(
+                    "description",
+                    "The story ends.",
+                ),
+            )
+        )
+
+        events.append(
+            EngineEvent(
+                "game_finished",
+                {"ending_id": ending_id},
+            )
+        )
+
+    def _transition(
+        self,
+        state: dict[str, Any],
+        target: str,
+        events: list[EngineEvent],
+    ) -> None:
+        target = self._require_string(
+            target,
+            "target_scene",
+        )
+
+        if target not in self._scenes:
+            raise ValueError(
+                f"Cannot transition to unknown scene '{target}'."
+            )
+
+        old = state.get("scene_id")
+        state["scene_id"] = target
+
+        events.append(
+            EngineEvent(
+                "scene_transition",
+                {
+                    "from_scene": old,
+                    "to_scene": target,
+                },
+            )
+        )
+
+    def _choose_winning_target(
+        self,
+        choices: list[dict[str, Any]],
+    ) -> str | None:
+        buckets: dict[str, list[dict[str, Any]]] = {}
+
+        for choice in choices:
+            target = self._choice_target(choice)
+
+            if target:
+                buckets.setdefault(
+                    target,
+                    [],
+                ).append(choice)
+
+        if not buckets:
+            return None
+
+        ranked = sorted(
+            buckets.items(),
+            key=lambda item: (
+                len(item[1]),
+                sum(
+                    self._as_int(
+                        choice.get("branch_priority", 0),
+                        "branch_priority",
+                        0,
+                    )
+                    for choice in item[1]
+                ),
+                str(item[0]),
+            ),
+            reverse=True,
+        )
+
+        return ranked[0][0]
+
+    def resolve_round(
+        self,
+        state: dict[str, Any] | None = None,
+        decisions: Iterable[dict[str, Any]] | None = None,
+        *,
+        scene_id: str | None = None,
+        round_number: int | None = None,
+        world_state: dict[str, Any] | None = None,
+        players: Iterable[dict[str, Any]] | None = None,
+    ) -> EngineResult:
+        if state is None:
+            if scene_id is None or round_number is None:
+                raise ValueError(
+                    "state or scene_id/round_number is required."
+                )
+
+            supplied_world = copy.deepcopy(
+                world_state or {}
+            )
+
+            state = {
+                "status": "active",
+                "round_number": int(round_number),
+                "scene_id": str(scene_id),
+                "players": copy.deepcopy(
+                    list(players or [])
+                ),
+                "world_state": supplied_world,
+                "flags": copy.deepcopy(
+                    supplied_world.get("flags", {})
+                ),
+                "variables": copy.deepcopy(
+                    supplied_world.get("variables", {})
+                ),
+                "relationships": copy.deepcopy(
+                    supplied_world.get("relationships", {})
+                ),
+                "knowledge": copy.deepcopy(
+                    supplied_world.get("knowledge", [])
+                ),
+                "history": [],
+                "ending_id": None,
+            }
+        else:
+            state = copy.deepcopy(state)
+
+        decisions_list = [
+            decision
+            for decision in list(decisions or [])
+            if isinstance(decision, dict)
+        ]
+
+        current_round = self._as_int(
+            state.get("round_number", 1),
+            "state.round_number",
+        )
+
+        decision_map = {
+            str(decision.get("user_id")): decision
+            for decision in decisions_list
+        }
+
+        missed_results: list[dict[str, Any]] = []
+        events: list[EngineEvent] = []
+        applied_choices: list[dict[str, Any]] = []
+
+        participants = [
+            player
+            for player in state.get("players", [])
+            if player.get("status", "active")
+            in {"active", "npc"}
+        ]
+
+        # Process EVERY participant.
+        # Human players use their submitted choice.
+        # NPCs choose deterministically.
+        # Missing humans count as a miss but do not freeze the game.
+        for player in sorted(
+            participants,
+            key=lambda item: str(item.get("user_id")),
+        ):
+            user_id = str(
+                player.get("user_id")
+            )
+
+            status = player.get(
+                "status",
+                "active",
+            )
+
+            decision = decision_map.get(
+                user_id
+            )
+
+            if decision is None:
+                if status == "active":
+                    missed = (
+                        self._as_int(
+                            player.get(
+                                "missed_decisions",
+                                0,
+                            ),
+                            "player.missed_decisions",
+                        )
+                        + 1
+                    )
+
+                    player["missed_decisions"] = missed
+
+                    missed_results.append(
+                        {
+                            "user_id": user_id,
+                            "missed_decisions": missed,
+                        }
+                    )
+
+                    continue
+
+                # NPC: deterministic first/highest-priority choice.
+                scene = self.get_scene(
+                    state["scene_id"]
+                )
+                choices = self._scene_choices(scene)
+
+                if not choices:
+                    continue
+
+                decision = {
+                    "choice_id": sorted(
+                        choices,
+                        key=lambda choice: (
+                            self._as_int(
+                                choice.get(
+                                    "branch_priority",
+                                    0,
+                                ),
+                                "branch_priority",
+                                0,
+                            ),
+                            str(
+                                choice.get(
+                                    "id",
+                                    "",
+                                )
+                            ),
+                        ),
+                        reverse=True,
+                    )[0]["id"]
+                }
+
+            choice_id = self._require_string(
+                decision.get("choice_id"),
+                "decision.choice_id",
+            )
+
+            role_id = str(
+                player.get(
+                    "role_id",
+                    "",
+                )
+            )
+
+            scene = self.get_scene(
+                state["scene_id"]
+            )
+
+            choice = self.validate_choice_for_role(
+                scene,
+                role_id,
+                choice_id,
+                state.get(
+                    "world_state",
+                    {},
+                ),
+            )
+
+            self._apply_effects(
+                state,
+                choice,
+            )
+
+            player["last_choice_id"] = choice_id
+            player["last_decision_round"] = current_round
+
+            if status == "active":
+                player["missed_decisions"] = 0
+
+            applied_choices.append(
+                choice
+            )
+
+            events.append(
+                EngineEvent(
+                    "round_decision_applied",
+                    {
+                        "round_number": current_round,
+                        "user_id": user_id,
+                        "choice_id": choice_id,
+                        "public_event": choice.get("public_event", ""),
+                        "text": (
+                            choice.get("effects", {}).get("text")
+                            if isinstance(choice.get("effects"), dict)
+                            else ""
+                        ),
+                    },
+                )
+            )
+
+        # If every human timed out and there are no NPCs/choices, use a
+        # deterministic fallback choice so the game still moves.
+        if not applied_choices:
+            scene = self.get_scene(
+                state["scene_id"]
+            )
+            available = self._scene_choices(
+                scene
+            )
+
+            if available:
+                fallback = sorted(
+                    available,
+                    key=lambda choice: (
+                        self._as_int(
+                            choice.get(
+                                "branch_priority",
+                                0,
+                            ),
+                            "branch_priority",
+                            0,
+                        ),
+                        str(
+                            choice.get(
+                                "id",
+                                "",
+                            )
+                        ),
+                    ),
+                    reverse=True,
+                )[0]
+
+                applied_choices.append(
+                    fallback
+                )
+
+                self._apply_effects(
+                    state,
+                    fallback,
+                )
+
+                events.append(
+                    EngineEvent(
+                        "timeout_default_choice",
+                        {
+                            "choice_id": fallback.get(
+                                "id"
+                            )
+                        },
+                    )
+                )
+
+        # Multiplayer branch resolution:
+        # majority target wins, branch_priority breaks ties.
+        #
+        # A single terminal vote must NOT automatically kill a multiplayer
+        # game if another target has more votes.
+        target = self._choose_winning_target(
+            applied_choices
+        )
+
+        if target in self._endings:
+            self._finish_game(
+                state,
+                str(target),
+                events,
+            )
+        elif (
+            target is None
+            and applied_choices
+            and all(
+                self._choice_is_terminal(choice)
+                or self._choice_ending_id(choice)
+                for choice in applied_choices
+            )
+        ):
+            terminal_choice = sorted(
+                applied_choices,
+                key=lambda choice: str(
+                    choice.get("id", "")
+                ),
+            )[0]
+
+            ending_id = (
+                self._choice_ending_id(
+                    terminal_choice
+                )
+                or self._ensure_terminal_ending(
+                    terminal_choice
+                )
+            )
+
+            self._finish_game(
+                state,
+                ending_id,
+                events,
+            )
+
+        if state.get("status") != "finished":
+            if target in self._endings:
+                self._finish_game(
+                    state,
+                    str(target),
+                    events,
+                )
+
+            elif target:
+                # IMPORTANT:
+                # Do not inspect the destination scene's ending now.
+                # It becomes the next round's scene.
+                self._transition(
+                    state,
+                    str(target),
+                    events,
+                )
+
+                state["round_number"] = (
+                    current_round + 1
+                )
+
+            else:
+                scene = self.get_scene(
+                    state["scene_id"]
+                )
+
+                automatic_target = None
+                transitions = scene.get(
+                    "transitions"
+                ) or []
+
+                temp_state = {
+                    "flags": state.get(
+                        "flags",
+                        {},
+                    ),
+                    "variables": state.get(
+                        "variables",
+                        {},
+                    ),
+                    "relationships": state.get(
+                        "relationships",
+                        {},
+                    ),
+                    "knowledge": state.get(
+                        "knowledge",
+                        [],
+                    ),
+                }
+
+                if isinstance(
+                    transitions,
+                    list,
+                ):
+                    for transition in transitions:
+                        if not isinstance(
+                            transition,
+                            dict,
+                        ):
+                            continue
+
+                        if self._conditions_met(
+                            temp_state,
+                            transition.get(
+                                "conditions",
+                                [],
+                            ),
+                        ):
+                            automatic_target = (
+                                transition.get(
+                                    "next_scene"
+                                )
+                                or transition.get(
+                                    "next_scene_id"
+                                )
+                            )
+
+                            if automatic_target:
+                                break
+
+                if automatic_target:
+                    self._transition(
+                        state,
+                        str(automatic_target),
+                        events,
+                    )
+
+                state["round_number"] = (
+                    current_round + 1
+                )
+
+        state["world_state"] = copy.deepcopy(
+            state.get(
+                "world_state",
+                {},
+            )
+        )
+
+        state["world_state"]["flags"] = copy.deepcopy(
+            state.get("flags", {})
+        )
+        state["world_state"]["variables"] = copy.deepcopy(
+            state.get("variables", {})
+        )
+        state["world_state"]["relationships"] = copy.deepcopy(
+            state.get("relationships", {})
+        )
+        state["world_state"]["knowledge"] = copy.deepcopy(
+            state.get("knowledge", [])
+        )
+
+        state.setdefault(
+            "history",
+            [],
+        ).append(
+            {
+                "round_number": current_round,
+                "decisions": copy.deepcopy(
+                    decisions_list
+                ),
+                "missed_results": copy.deepcopy(
+                    missed_results
+                ),
+                "scene_id": state.get(
+                    "scene_id"
+                ),
+                "ending_id": state.get(
+                    "ending_id"
+                ),
+            }
+        )
+
+        return EngineResult(
+            state=state,
+            events=events,
+            changed=True,
+            missed_results=missed_results,
+        )
+
+    # ------------------------------------------------------------------
+    # Compatibility helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
     def events_to_dict(
@@ -1420,7 +1389,9 @@ class GameEngine:
         return [
             {
                 "event_type": event.event_type,
-                "payload": copy.deepcopy(event.payload),
+                "payload": copy.deepcopy(
+                    event.payload
+                ),
             }
             for event in events
         ]
@@ -1429,11 +1400,97 @@ class GameEngine:
         self,
         scene_id: str,
     ) -> dict[str, Any]:
-        scene = self.get_scene(scene_id)
+        return self.get_scene(scene_id)
 
-        result = copy.deepcopy(scene)
+    def create_initial_state(
+        self,
+        players: Iterable[dict[str, Any]],
+    ) -> dict[str, Any]:
+        player_list = [
+            copy.deepcopy(player)
+            for player in players
+        ]
 
-        # Keep internal conditions/effects out of simple UI payloads
-        # only when explicitly requested by the caller; by default
-        # preserve them because game_service.py may need them.
-        return result
+        if not player_list:
+            raise ValueError(
+                "At least one player is required."
+            )
+
+        self.validate_player_count(
+            len(player_list)
+        )
+
+        return {
+            "status": "active",
+            "round_number": 1,
+            "scene_id": self.first_scene_id(),
+            "players": player_list,
+            "world_state": self.initial_world_state(),
+            "flags": copy.deepcopy(
+                self.story.get(
+                    "initial_flags",
+                    {},
+                )
+            ),
+            "variables": copy.deepcopy(
+                self.story.get(
+                    "initial_variables",
+                    {},
+                )
+            ),
+            "relationships": copy.deepcopy(
+                self.story.get(
+                    "initial_relationships",
+                    {},
+                )
+            ),
+            "knowledge": copy.deepcopy(
+                self.story.get(
+                    "initial_knowledge",
+                    [],
+                )
+            ),
+            "history": [],
+            "ending_id": None,
+            "story_fingerprint": self.story_fingerprint(),
+        }
+
+    def active_players(
+        self,
+        state: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        return [
+            player
+            for player in state.get("players", [])
+            if player.get(
+                "status",
+                "active",
+            )
+            == "active"
+        ]
+
+    def validate_role_assignments(
+        self,
+        players: Iterable[dict[str, Any]],
+    ) -> None:
+        seen: set[str] = set()
+
+        for player in players:
+            role_id = player.get("role_id")
+
+            if not role_id:
+                continue
+
+            role_id = self._require_string(
+                role_id,
+                "player.role_id",
+            )
+
+            self.get_role(role_id)
+
+            if role_id in seen:
+                raise ValueError(
+                    f"Role '{role_id}' has been assigned more than once."
+                )
+
+            seen.add(role_id)

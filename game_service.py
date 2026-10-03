@@ -5,11 +5,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from database import (
-    Database,
-    DatabaseConflict,
-    DatabaseError,
-)
+from database import Database, DatabaseConflict, DatabaseError
 from engine import GameEngine
 from story_generator import StoryGenerator
 
@@ -19,26 +15,10 @@ logger = logging.getLogger("YourOwnVision.game_service")
 
 class GameService:
     """
-    Application/game orchestration layer.
+    Persistent WHAT HAPPENS? game orchestration.
 
-    Telegram
-        ↓
-    GameService
-        ↓
-    Database  ← authoritative persistent state
-        ↑
-    GameEngine ← deterministic gameplay
-        ↑
-    StoryGenerator ← Gemini story preparation only
-
-    This class never:
-
-    - imports Telegram
-    - sends Telegram messages
-    - polls Telegram
-    - stores authoritative game state in memory
-    - uses an in-memory timer as the source of truth
-    - calls Gemini for player decisions
+    The database remains authoritative. Render restarts only require
+    deadline recovery; no gameplay timer is stored in Python memory.
     """
 
     STATUS_LOBBY = "lobby"
@@ -54,7 +34,6 @@ class GameService:
     PLAYER_NPC = "npc"
     PLAYER_LEFT = "left"
 
-    MAX_PLAYERS = 100
     MAX_MISSED_DECISIONS = 3
 
     def __init__(
@@ -62,38 +41,20 @@ class GameService:
         db: Database,
         story_generator: StoryGenerator,
         *,
-        join_seconds: int = 60,
-        default_decision_seconds: int = 35,
+        join_seconds: int = 45,
+        default_decision_seconds: int = 45,
         minimum_decision_seconds: int = 15,
         maximum_decision_seconds: int = 900,
         maximum_players: int = 4,
     ) -> None:
         self.db = db
         self.story_generator = story_generator
-
-        self.max_players = max(
-            1,
-            min(
-                int(maximum_players),
-                50,
-            ),
-        )
-
-        self.join_seconds = max(
-            10,
-            int(join_seconds),
-        )
-
-        self.minimum_decision_seconds = max(
-            5,
-            int(minimum_decision_seconds),
-        )
-
+        self.join_seconds = max(10, int(join_seconds))
+        self.minimum_decision_seconds = max(5, int(minimum_decision_seconds))
         self.maximum_decision_seconds = max(
             self.minimum_decision_seconds,
             int(maximum_decision_seconds),
         )
-
         self.default_decision_seconds = min(
             self.maximum_decision_seconds,
             max(
@@ -101,10 +62,7 @@ class GameService:
                 int(default_decision_seconds),
             ),
         )
-
-    # ============================================================
-    # TIME
-    # ============================================================
+        self.max_players = max(1, min(int(maximum_players), 50))
 
     @staticmethod
     def now_utc() -> datetime:
@@ -113,119 +71,63 @@ class GameService:
     @staticmethod
     def to_iso(value: datetime) -> str:
         if value.tzinfo is None:
-            value = value.replace(
-                tzinfo=timezone.utc
-            )
-
-        return value.astimezone(
-            timezone.utc
-        ).isoformat()
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat()
 
     @staticmethod
-    def parse_timestamp(
-        value: Any,
-    ) -> datetime | None:
+    def parse_timestamp(value: Any) -> datetime | None:
         if value is None:
             return None
 
         if isinstance(value, datetime):
             result = value
-
         elif isinstance(value, str):
             try:
                 result = datetime.fromisoformat(
-                    value.replace(
-                        "Z",
-                        "+00:00",
-                    )
+                    value.replace("Z", "+00:00")
                 )
             except ValueError:
-                logger.warning(
-                    "Invalid database timestamp: %r",
-                    value,
-                )
                 return None
-
         else:
             return None
 
         if result.tzinfo is None:
-            result = result.replace(
-                tzinfo=timezone.utc
-            )
+            result = result.replace(tzinfo=timezone.utc)
 
-        return result.astimezone(
-            timezone.utc
-        )
+        return result.astimezone(timezone.utc)
 
-    # ============================================================
-    # GAME LOOKUP
-    # ============================================================
-
-    async def get_game(
-        self,
-        game_id: str,
-    ) -> dict[str, Any]:
-        game = await self.db.get_game(
-            game_id
-        )
+    async def get_game(self, game_id: str) -> dict[str, Any]:
+        game = await self.db.get_game(game_id)
 
         if not game:
-            raise ValueError(
-                "Game does not exist."
-            )
+            raise ValueError("Game does not exist.")
 
         return game
 
     async def get_game_with_players(
         self,
         game_id: str,
-    ) -> tuple[
-        dict[str, Any],
-        list[dict[str, Any]],
-    ]:
-        game = await self.get_game(
-            game_id
-        )
-
-        players = await self.db.get_players(
-            game_id
-        )
-
-        return game, players
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        game = await self.get_game(game_id)
+        return game, await self.db.get_players(game_id)
 
     def engine_for_game(
         self,
         game: dict[str, Any],
     ) -> GameEngine:
-        story = game.get(
-            "story"
-        )
+        story = game.get("story")
 
-        if not isinstance(
-            story,
-            dict,
-        ):
-            raise ValueError(
-                "Game does not contain a valid story."
-            )
+        if not isinstance(story, dict):
+            raise ValueError("Game does not contain a valid story.")
 
-        return GameEngine(
-            story
-        )
-
-    # ============================================================
-    # PLAYER STATUS
-    # ============================================================
+        return GameEngine(story)
 
     @classmethod
     def player_status(
         cls,
         player: dict[str, Any],
     ) -> str:
-        status = player.get(
-            "status"
-        )
+        status = player.get("status")
 
         if status in {
             cls.PLAYER_PENDING,
@@ -236,23 +138,18 @@ class GameService:
         }:
             return status
 
-        # Compatibility with older database rows.
-        if player.get(
-            "active",
-            False,
-        ):
-            return cls.PLAYER_ACTIVE
-
-        return cls.PLAYER_LEFT
+        return (
+            cls.PLAYER_ACTIVE
+            if player.get("active", False)
+            else cls.PLAYER_LEFT
+        )
 
     @classmethod
     def is_counted_player(
         cls,
         player: dict[str, Any],
     ) -> bool:
-        return cls.player_status(
-            player
-        ) in {
+        return cls.player_status(player) in {
             cls.PLAYER_PENDING,
             cls.PLAYER_ACTIVE,
         }
@@ -263,9 +160,7 @@ class GameService:
         player: dict[str, Any],
         round_number: int,
     ) -> bool:
-        status = cls.player_status(
-            player
-        )
+        status = cls.player_status(player)
 
         if status not in {
             cls.PLAYER_ACTIVE,
@@ -274,74 +169,102 @@ class GameService:
             return False
 
         joined_round = int(
-            player.get(
-                "joined_round",
-                0,
-            )
-            or 0
+            player.get("joined_round", 0) or 0
         )
 
-        return joined_round <= int(
-            round_number
-        )
+        return joined_round <= int(round_number)
 
-    @classmethod
-    def active_human_players(
-        cls,
-        players: list[dict[str, Any]],
-        round_number: int,
-    ) -> list[dict[str, Any]]:
-        return [
-            player
-            for player in players
-            if cls.player_status(player)
-            == cls.PLAYER_ACTIVE
-            and cls.is_required_for_round(
-                player,
-                round_number,
+    # ------------------------------------------------------------------
+    # Story generation/reuse
+    # ------------------------------------------------------------------
+
+    async def _get_reusable_empty_story(
+        self,
+    ) -> tuple[dict[str, Any], str, int] | None:
+        """
+        Reuse a story from a cancelled lobby only when ZERO players
+        ever joined it. A story that had a player is never reused.
+        """
+
+        try:
+            rows = await self.db.request(
+                "GET",
+                "games",
+                params={
+                    "select": (
+                        "id,story,story_fingerprint,story_player_count"
+                    ),
+                    "status": "eq.cancelled",
+                    "order": "created_at.desc",
+                    "limit": "50",
+                },
             )
-        ]
+        except Exception:
+            logger.exception(
+                "Could not search cancelled games for reusable stories."
+            )
+            return None
 
-    # ============================================================
-    # STORY GENERATION
-    # ============================================================
+        for row in rows or []:
+            story = row.get("story")
+
+            if not isinstance(story, dict):
+                continue
+
+            try:
+                players = await self.db.get_players(
+                    str(row["id"])
+                )
+            except Exception:
+                logger.exception(
+                    "Could not inspect cancelled game %s.",
+                    row.get("id"),
+                )
+                continue
+
+            if players:
+                continue
+
+            fingerprint = row.get("story_fingerprint")
+
+            if not fingerprint:
+                fingerprint = GameEngine(story).story_fingerprint()
+
+            engine = GameEngine(story)
+            playable = len(engine.playable_roles())
+
+            if playable < 1:
+                continue
+
+            return (
+                story,
+                str(fingerprint),
+                min(
+                    self.max_players,
+                    playable,
+                ),
+            )
+
+        return None
 
     async def generate_unique_story(
         self,
         *,
         player_count: int,
         max_attempts: int = 5,
-    ) -> tuple[
-        dict[str, Any],
-        str,
-    ]:
-        if player_count < 1:
-            raise ValueError(
-                "player_count must be at least 1."
-            )
-
+    ) -> tuple[dict[str, Any], str]:
         recent = await self.db.get_recent_fingerprints(
             limit=100
         )
+        previous = list(recent)
 
-        previous = list(
-            recent
-        )
-
-        for _ in range(
-            max_attempts
-        ):
-            story, fingerprint = (
-                await self.story_generator.generate(
-                    player_count=player_count,
-                    previous_fingerprints=previous,
-                )
+        for _ in range(max_attempts):
+            story, fingerprint = await self.story_generator.generate(
+                player_count=player_count,
+                previous_fingerprints=previous,
             )
 
-            engine = GameEngine(
-                story
-            )
-
+            engine = GameEngine(story)
             self.validate_player_count(
                 player_count,
                 engine,
@@ -350,26 +273,19 @@ class GameService:
             if fingerprint in previous:
                 continue
 
-            if await self.db.fingerprint_exists(
-                fingerprint
-            ):
-                previous.append(
-                    fingerprint
-                )
+            if await self.db.fingerprint_exists(fingerprint):
+                previous.append(fingerprint)
                 continue
 
-            return (
-                story,
-                fingerprint,
-            )
+            return story, fingerprint
 
         raise RuntimeError(
             "Unable to generate a unique validated story."
         )
 
-    # ============================================================
-    # GAME CREATION
-    # ============================================================
+    # ------------------------------------------------------------------
+    # Game creation
+    # ------------------------------------------------------------------
 
     async def create_game(
         self,
@@ -377,41 +293,42 @@ class GameService:
         chat_id: int,
         creator_id: int,
     ) -> dict[str, Any]:
-        existing = await self.db.get_active_game(
-            chat_id
-        )
+        existing = await self.db.get_active_game(chat_id)
 
         if existing:
             raise DatabaseConflict(
                 "This chat already has an active game."
             )
 
-        # A lobby does not yet know the final player count.
-        #
-        # The generator is therefore asked for the configured
-        # minimum viable story. Later joins are still checked
-        # against the actual playable roles.
-        story_player_count = self.max_players
+        reusable = await self._get_reusable_empty_story()
 
-        story, fingerprint = (
-            await self.generate_unique_story(
+        if reusable:
+            story, fingerprint, story_player_count = reusable
+            logger.info(
+                "Reusing previously unused story. fingerprint=%s",
+                fingerprint,
+            )
+        else:
+            story_player_count = self.max_players
+            story, fingerprint = await self.generate_unique_story(
                 player_count=story_player_count
             )
+
+        engine = GameEngine(story)
+
+        story_player_count = min(
+            story_player_count,
+            len(engine.playable_roles()),
         )
 
-        engine = GameEngine(
-            story
-        )
-
-        world_state = (
-            engine.initial_world_state()
-        )
+        if story_player_count < 1:
+            raise ValueError(
+                "Generated story has no playable roles."
+            )
 
         join_deadline = (
             self.now_utc()
-            + timedelta(
-                seconds=self.join_seconds
-            )
+            + timedelta(seconds=self.join_seconds)
         )
 
         game = await self.db.create_game(
@@ -419,10 +336,8 @@ class GameService:
             creator_id=creator_id,
             story=story,
             fingerprint=fingerprint,
-            join_deadline=self.to_iso(
-                join_deadline
-            ),
-            world_state=world_state,
+            join_deadline=self.to_iso(join_deadline),
+            world_state=engine.initial_world_state(),
             story_player_count=story_player_count,
         )
 
@@ -433,10 +348,7 @@ class GameService:
                 player_count=story_player_count,
             )
         except DatabaseConflict:
-            logger.warning(
-                "Story fingerprint already existed: %s",
-                fingerprint,
-            )
+            pass
 
         await self.db.append_event(
             game_id=game["id"],
@@ -446,14 +358,18 @@ class GameService:
             payload={
                 "chat_id": chat_id,
                 "story_fingerprint": fingerprint,
+                "reused_unused_story": bool(reusable),
             },
         )
 
+        # IMPORTANT: /play does NOT automatically join the sender.
+        # The lobby can therefore genuinely remain empty and its story
+        # can be reused if nobody presses JOIN.
         return game
 
-    # ============================================================
-    # JOIN / LEAVE
-    # ============================================================
+    # ------------------------------------------------------------------
+    # Join / leave
+    # ------------------------------------------------------------------
 
     async def join_game(
         self,
@@ -463,13 +379,8 @@ class GameService:
         username: str,
         display_name: str,
     ) -> dict[str, Any]:
-        game = await self.get_game(
-            game_id
-        )
-
-        status = game.get(
-            "status"
-        )
+        game = await self.get_game(game_id)
+        status = str(game.get("status"))
 
         if status not in {
             self.STATUS_LOBBY,
@@ -479,35 +390,36 @@ class GameService:
                 "This game is not accepting new players."
             )
 
+        if status == self.STATUS_LOBBY:
+            deadline = self.parse_timestamp(
+                game.get("join_deadline")
+            )
+
+            if (
+                deadline is not None
+                and self.now_utc() >= deadline
+            ):
+                await self.finish_lobby(game_id)
+                raise ValueError(
+                    "The 45-second lobby has already closed."
+                )
+
         existing = await self.db.get_player(
             game_id,
             user_id,
         )
 
         if existing:
-            existing_status = self.player_status(
-                existing
-            )
-
-            if existing_status == self.PLAYER_LEFT:
-                raise ValueError(
-                    "A player who left cannot rejoin."
-                )
-
             raise ValueError(
                 "You are already in this game."
             )
 
-        players = await self.db.get_players(
-            game_id
-        )
+        players = await self.db.get_players(game_id)
 
         counted = sum(
             1
             for player in players
-            if self.is_counted_player(
-                player
-            )
+            if self.is_counted_player(player)
         )
 
         if counted >= self.max_players:
@@ -515,18 +427,14 @@ class GameService:
                 "The game has reached its player limit."
             )
 
-        engine = self.engine_for_game(
-            game
-        )
+        engine = self.engine_for_game(game)
 
         assigned_role_ids = {
             str(player["role_id"])
             for player in players
             if player.get("role_id")
             and self.player_status(player)
-            not in {
-                self.PLAYER_LEFT,
-            }
+            != self.PLAYER_LEFT
         }
 
         available_roles = [
@@ -537,31 +445,50 @@ class GameService:
 
         if not available_roles:
             raise ValueError(
-                "The story has no unused playable role "
-                "for another player."
+                "The story has no unused playable role for another player."
             )
 
         current_round = int(
-            game.get(
-                "current_round",
-                0,
-            )
-            or 0
+            game.get("current_round", 0) or 0
         )
 
         if status == self.STATUS_LOBBY:
             joined_round = 0
+            player_status = self.PLAYER_PENDING
+            role_id = None
         else:
+            # Late joiners NEVER enter the current round.
             joined_round = current_round + 1
+            player_status = self.PLAYER_PENDING
+            role_id = sorted(
+                role["id"]
+                for role in available_roles
+            )[0]
 
         player = await self.db.add_player(
             game_id=game_id,
             user_id=user_id,
             username=username or "",
             display_name=display_name or "Player",
+            role_id=role_id,
             joined_round=joined_round,
-            status=self.PLAYER_PENDING,
+            status=player_status,
         )
+
+        if status == self.STATUS_PLAYING:
+            await self.db.assign_role(
+                game_id,
+                user_id,
+                role_id,
+            )
+
+            player = (
+                await self.db.get_player(
+                    game_id,
+                    user_id,
+                )
+                or player
+            )
 
         await self.db.append_event(
             game_id=game_id,
@@ -570,6 +497,7 @@ class GameService:
             user_id=user_id,
             payload={
                 "joined_round": joined_round,
+                "late_join": status == self.STATUS_PLAYING,
                 "display_name": display_name or "Player",
             },
         )
@@ -590,11 +518,7 @@ class GameService:
         if not player:
             return
 
-        status = self.player_status(
-            player
-        )
-
-        if status in {
+        if self.player_status(player) in {
             self.PLAYER_LEFT,
             self.PLAYER_ELIMINATED,
         }:
@@ -615,45 +539,9 @@ class GameService:
             payload={},
         )
 
-    async def eliminate_player(
-        self,
-        *,
-        game_id: str,
-        user_id: int,
-    ) -> None:
-        await self.db.eliminate_player(
-            game_id,
-            user_id,
-        )
-
-        await self.db.append_event(
-            game_id=game_id,
-            event_type="player_eliminated",
-            user_id=user_id,
-            payload={},
-        )
-
-    async def convert_player_to_npc(
-        self,
-        *,
-        game_id: str,
-        user_id: int,
-    ) -> None:
-        await self.db.convert_player_to_npc(
-            game_id,
-            user_id,
-        )
-
-        await self.db.append_event(
-            game_id=game_id,
-            event_type="player_converted_to_npc",
-            user_id=user_id,
-            payload={},
-        )
-
-    # ============================================================
-    # PLAYER COUNT / ROLE ASSIGNMENT
-    # ============================================================
+    # ------------------------------------------------------------------
+    # Roles / start
+    # ------------------------------------------------------------------
 
     @staticmethod
     def validate_player_count(
@@ -665,14 +553,12 @@ class GameService:
                 "At least one player is required."
             )
 
-        playable_count = len(
+        if player_count > len(
             engine.playable_roles()
-        )
-
-        if player_count > playable_count:
+        ):
             raise ValueError(
-                f"Story has only {playable_count} playable roles "
-                f"but requires {player_count}."
+                f"Story has only {len(engine.playable_roles())} "
+                f"playable roles but has {player_count} players."
             )
 
     async def assign_roles(
@@ -684,11 +570,9 @@ class GameService:
             game_id
         )
 
-        engine = self.engine_for_game(
-            game
-        )
+        engine = self.engine_for_game(game)
 
-        eligible_players = [
+        eligible = [
             player
             for player in players
             if self.player_status(player)
@@ -698,78 +582,44 @@ class GameService:
             }
         ]
 
-        if not eligible_players:
-            raise ValueError(
-                "There are no players to assign roles to."
-            )
-
         self.validate_player_count(
-            len(eligible_players),
+            len(eligible),
             engine,
         )
 
-        # Never reuse an already assigned role.
-        existing_assignments: dict[str, int] = {}
+        used = {
+            str(player["role_id"])
+            for player in players
+            if player.get("role_id")
+            and self.player_status(player)
+            != self.PLAYER_LEFT
+        }
 
-        for player in players:
-            role_id = player.get(
-                "role_id"
-            )
-
-            if not role_id:
-                continue
-
-            if self.player_status(player) in {
-                self.PLAYER_LEFT,
-            }:
-                continue
-
-            if role_id in existing_assignments:
-                raise DatabaseConflict(
-                    f"Role {role_id} is already assigned to "
-                    "more than one player."
-                )
-
-            existing_assignments[role_id] = int(
-                player["user_id"]
-            )
-
-        available_roles = [
+        available = sorted(
             role["id"]
             for role in engine.playable_roles()
-            if role["id"]
-            not in existing_assignments
-        ]
+            if role["id"] not in used
+        )
 
         unassigned = [
             player
-            for player in eligible_players
+            for player in eligible
             if not player.get("role_id")
         ]
 
-        if len(available_roles) < len(unassigned):
-            raise ValueError(
-                "Not enough unused playable roles remain."
-            )
-
-        # Deterministic assignment.
         unassigned.sort(
             key=lambda player: str(
                 player["user_id"]
             )
         )
 
-        available_roles.sort()
-
         assignments: dict[int, str] = {}
 
         for player, role_id in zip(
             unassigned,
-            available_roles,
+            available,
         ):
-            user_id = int(
-                player["user_id"]
-            )
+            user_id = int(player["user_id"])
 
             await self.db.assign_role(
                 game_id,
@@ -780,10 +630,6 @@ class GameService:
             assignments[user_id] = role_id
 
         return assignments
-
-    # ============================================================
-    # START GAME
-    # ============================================================
 
     async def start_game(
         self,
@@ -802,25 +648,21 @@ class GameService:
                 "Game cannot be started from its current state."
             )
 
-        active_players = [
+        participants = [
             player
             for player in players
-            if self.is_counted_player(
-                player
-            )
+            if self.is_counted_player(player)
         ]
 
-        if not active_players:
+        if not participants:
             raise ValueError(
                 "At least one player is required."
             )
 
-        engine = self.engine_for_game(
-            game
-        )
+        engine = self.engine_for_game(game)
 
         self.validate_player_count(
-            len(active_players),
+            len(participants),
             engine,
         )
 
@@ -828,22 +670,11 @@ class GameService:
             game_id=game_id
         )
 
-        # Reload after role assignment so the database is the
-        # source of truth.
-        players = await self.db.get_players(
-            game_id
-        )
-
         scene_id = engine.first_scene_id()
-
-        scene = engine.get_scene(
-            scene_id
-        )
+        scene = engine.get_scene(scene_id)
 
         world_state = engine.enter_scene(
-            game.get(
-                "world_state"
-            )
+            game.get("world_state")
             or engine.initial_world_state(),
             scene_id,
         )
@@ -858,18 +689,14 @@ class GameService:
 
         deadline = (
             self.now_utc()
-            + timedelta(
-                seconds=timer_seconds
-            )
+            + timedelta(seconds=timer_seconds)
         )
 
         started = await self.db.start_game_atomic(
             game_id,
             scene_id=scene_id,
             round_number=1,
-            decision_deadline=self.to_iso(
-                deadline
-            ),
+            decision_deadline=self.to_iso(deadline),
             world_state=world_state,
         )
 
@@ -879,17 +706,15 @@ class GameService:
             round_number=1,
             payload={
                 "scene_id": scene_id,
-                "decision_deadline": self.to_iso(
-                    deadline
-                ),
+                "decision_deadline": self.to_iso(deadline),
             },
         )
 
         return started
 
-    # ============================================================
-    # DECISIONS
-    # ============================================================
+    # ------------------------------------------------------------------
+    # Decisions
+    # ------------------------------------------------------------------
 
     async def submit_decision(
         self,
@@ -898,9 +723,7 @@ class GameService:
         user_id: int,
         choice_id: str,
     ) -> dict[str, Any]:
-        game = await self.get_game(
-            game_id
-        )
+        game = await self.get_game(game_id)
 
         if game.get("status") != self.STATUS_PLAYING:
             raise ValueError(
@@ -908,16 +731,10 @@ class GameService:
             )
 
         round_number = int(
-            game.get(
-                "current_round",
-                0,
-            )
-            or 0
+            game.get("current_round", 0) or 0
         )
 
-        scene_id = game.get(
-            "current_scene_id"
-        )
+        scene_id = game.get("current_scene_id")
 
         if not scene_id:
             raise ValueError(
@@ -940,11 +757,7 @@ class GameService:
             )
 
         joined_round = int(
-            player.get(
-                "joined_round",
-                0,
-            )
-            or 0
+            player.get("joined_round", 0) or 0
         )
 
         if joined_round > round_number:
@@ -953,35 +766,24 @@ class GameService:
             )
 
         deadline = self.parse_timestamp(
-            game.get(
-                "decision_deadline"
+            game.get("decision_deadline")
+        )
+
+        if (
+            deadline is not None
+            and self.now_utc() >= deadline
+        ):
+            await self.resolve_round_if_due(
+                game_id=game_id,
+                expected_round=round_number,
             )
-        )
+            raise ValueError(
+                "The decision deadline has expired."
+            )
 
-        if deadline is not None:
-            if self.now_utc() >= deadline:
-                # Timeout handling and this request can race.
-                # The resolver below is the authoritative arbiter.
-                await self.resolve_round_if_due(
-                    game_id=game_id,
-                    expected_round=round_number,
-                )
-
-                raise ValueError(
-                    "The decision deadline has expired."
-                )
-
-        engine = self.engine_for_game(
-            game
-        )
-
-        scene = engine.get_scene(
-            scene_id
-        )
-
-        role_id = player.get(
-            "role_id"
-        )
+        engine = self.engine_for_game(game)
+        scene = engine.get_scene(scene_id)
+        role_id = player.get("role_id")
 
         if not role_id:
             raise ValueError(
@@ -989,12 +791,8 @@ class GameService:
             )
 
         world_state = (
-            game.get(
-                "world_state"
-            )
-            or await self.db.get_world_state(
-                game_id
-            )
+            game.get("world_state")
+            or await self.db.get_world_state(game_id)
             or engine.initial_world_state()
         )
 
@@ -1014,16 +812,14 @@ class GameService:
         )
 
         if not created:
-            existing = await self.db.get_decision(
-                game_id,
-                round_number,
-                user_id,
-            )
-
             return {
                 "accepted": False,
                 "duplicate": True,
-                "decision": existing,
+                "decision": await self.db.get_decision(
+                    game_id,
+                    round_number,
+                    user_id,
+                ),
             }
 
         await self.db.reset_missed_decisions(
@@ -1042,33 +838,30 @@ class GameService:
             },
         )
 
-        result = await self.resolve_if_ready(
+        resolution = await self.resolve_if_ready(
             game_id=game_id
         )
 
         return {
             "accepted": True,
             "duplicate": False,
-            "resolved": bool(result),
-            "resolution": result,
+            "resolved": bool(resolution),
+            "resolution": resolution,
         }
 
-    # ============================================================
-    # ROUND RESOLUTION
-    # ============================================================
+    # ------------------------------------------------------------------
+    # Resolution
+    # ------------------------------------------------------------------
 
+    @staticmethod
     def resolution_key(
-        self,
         game_id: str,
         round_number: int,
     ) -> str:
-        raw = (
-            f"{game_id}:"
-            f"{round_number}"
-        )
-
         return hashlib.sha256(
-            raw.encode("utf-8")
+            f"{game_id}:{round_number}".encode(
+                "utf-8"
+            )
         ).hexdigest()
 
     async def _resolve_round(
@@ -1080,9 +873,7 @@ class GameService:
         round_number: int,
         force_timeout: bool,
     ) -> dict[str, Any]:
-        engine = self.engine_for_game(
-            game
-        )
+        engine = self.engine_for_game(game)
 
         scene_id = game.get(
             "current_scene_id"
@@ -1094,9 +885,7 @@ class GameService:
             )
 
         world_state = (
-            game.get(
-                "world_state"
-            )
+            game.get("world_state")
             or await self.db.get_world_state(
                 game["id"]
             )
@@ -1113,28 +902,22 @@ class GameService:
         ]
 
         if not force_timeout:
-            human_players = [
-                player
+            required_humans = {
+                int(player["user_id"])
                 for player in eligible_players
                 if self.player_status(player)
                 == self.PLAYER_ACTIVE
-            ]
+            }
 
             decision_users = {
-                int(
-                    decision["user_id"]
-                )
+                int(decision["user_id"])
                 for decision in decisions
             }
 
-            if any(
-                int(player["user_id"])
-                not in decision_users
-                for player in human_players
+            if not required_humans.issubset(
+                decision_users
             ):
-                raise RuntimeError(
-                    "Round is not ready for resolution."
-                )
+                return None  # type: ignore[return-value]
 
         result = engine.resolve_round(
             scene_id=scene_id,
@@ -1144,10 +927,7 @@ class GameService:
             decisions=decisions,
         )
 
-        # Persist missed-decision state.
-        #
-        # This is intentionally done before the atomic round
-        # completion so that the database remains authoritative.
+        # Persist missed human decisions.
         for missed in result.get(
             "missed_results",
             [],
@@ -1156,11 +936,7 @@ class GameService:
                 missed["user_id"]
             )
 
-            new_count = int(
-                missed["missed_decisions"]
-            )
-
-            await self.db.increment_missed_decisions(
+            new_count = await self.db.increment_missed_decisions(
                 game["id"],
                 user_id,
             )
@@ -1181,7 +957,6 @@ class GameService:
                         "missed_decisions": new_count,
                     },
                 )
-
             else:
                 await self.db.append_event(
                     game_id=game["id"],
@@ -1193,23 +968,15 @@ class GameService:
                     },
                 )
 
-        ending = result.get(
-            "ending"
-        )
-
-        next_scene_id = result.get(
-            "next_scene"
-        )
+        ending = result.get("ending")
+        next_scene_id = result.get("next_scene")
 
         if ending:
             next_round_number = None
             next_deadline = None
             game_status = self.STATUS_COMPLETED
-
         elif next_scene_id:
-            next_round_number = (
-                round_number + 1
-            )
+            next_round_number = round_number + 1
 
             next_scene = engine.get_scene(
                 next_scene_id
@@ -1219,33 +986,25 @@ class GameService:
                 self.maximum_decision_seconds,
                 max(
                     self.minimum_decision_seconds,
-                    engine.timer_seconds(
-                        next_scene
-                    ),
+                    engine.timer_seconds(next_scene),
                 ),
             )
 
             next_deadline = (
                 self.now_utc()
-                + timedelta(
-                    seconds=timer_seconds
-                )
+                + timedelta(seconds=timer_seconds)
             )
 
             next_deadline_iso = self.to_iso(
                 next_deadline
             )
 
-            result["next_deadline"] = (
-                next_deadline_iso
-            )
-
+            result["next_deadline"] = next_deadline_iso
             game_status = self.STATUS_PLAYING
-
         else:
+            # A malformed engine result must never silently freeze the game.
             raise ValueError(
-                "Round produced neither an ending nor "
-                "a next scene."
+                "Round produced neither an ending nor a next scene."
             )
 
         resolution_key = self.resolution_key(
@@ -1260,18 +1019,17 @@ class GameService:
         )
 
         if not claimed:
-            # Another worker/callback owns the resolution.
-            # This is expected during timeout/click races.
             return {
                 "resolved": False,
                 "already_claimed": True,
                 "round_number": round_number,
             }
 
-        if ending:
-            deadline_iso = None
-        else:
-            deadline_iso = result["next_deadline"]
+        deadline_iso = (
+            None
+            if ending
+            else result["next_deadline"]
+        )
 
         completed = await self.db.complete_round_atomic(
             game_id=game["id"],
@@ -1321,11 +1079,7 @@ class GameService:
             return None
 
         round_number = int(
-            game.get(
-                "current_round",
-                0,
-            )
-            or 0
+            game.get("current_round", 0) or 0
         )
 
         decisions = await self.db.get_round_decisions(
@@ -1333,29 +1087,26 @@ class GameService:
             round_number,
         )
 
-        required_players = [
-            player
-            for player in players
-            if self.is_required_for_round(
-                player,
-                round_number,
-            )
-        ]
-
-        required_user_ids = {
+        required_humans = {
             int(player["user_id"])
-            for player in required_players
-            if self.player_status(player)
-            == self.PLAYER_ACTIVE
+            for player in players
+            if (
+                self.player_status(player)
+                == self.PLAYER_ACTIVE
+                and self.is_required_for_round(
+                    player,
+                    round_number,
+                )
+            )
         }
 
-        decision_user_ids = {
+        decision_users = {
             int(decision["user_id"])
             for decision in decisions
         }
 
-        if not required_user_ids.issubset(
-            decision_user_ids
+        if not required_humans.issubset(
+            decision_users
         ):
             return None
 
@@ -1381,11 +1132,7 @@ class GameService:
             return None
 
         round_number = int(
-            game.get(
-                "current_round",
-                0,
-            )
-            or 0
+            game.get("current_round", 0) or 0
         )
 
         if (
@@ -1395,9 +1142,7 @@ class GameService:
             return None
 
         deadline = self.parse_timestamp(
-            game.get(
-                "decision_deadline"
-            )
+            game.get("decision_deadline")
         )
 
         if deadline is None:
@@ -1421,78 +1166,51 @@ class GameService:
             force_timeout=True,
         )
 
-    # Backwards-compatible public method.
     async def resolve_round(
         self,
         *,
         game_id: str,
     ) -> dict[str, Any] | None:
-        game, players = await self.get_game_with_players(
-            game_id
+        return await self.resolve_round_if_due(
+            game_id=game_id
         )
 
-        if game.get("status") != self.STATUS_PLAYING:
-            return None
-
-        round_number = int(
-            game.get(
-                "current_round",
-                0,
-            )
-            or 0
-        )
-
-        decisions = await self.db.get_round_decisions(
-            game_id,
-            round_number,
-        )
-
-        return await self._resolve_round(
-            game=game,
-            players=players,
-            decisions=decisions,
-            round_number=round_number,
-            force_timeout=True,
-        )
-
-    # ============================================================
-    # START/LOBBY RECOVERY
-    # ============================================================
+    # ------------------------------------------------------------------
+    # Lobby / recovery
+    # ------------------------------------------------------------------
 
     async def finish_lobby(
         self,
         game_id: str,
     ) -> dict[str, Any] | None:
-        game = await self.get_game(
-            game_id
-        )
+        game = await self.get_game(game_id)
 
         if game.get("status") != self.STATUS_LOBBY:
             return None
 
         deadline = self.parse_timestamp(
-            game.get(
-                "join_deadline"
-            )
+            game.get("join_deadline")
         )
 
-        if deadline is not None:
-            if self.now_utc() < deadline:
-                return None
+        if (
+            deadline is not None
+            and self.now_utc() < deadline
+        ):
+            return None
 
         players = await self.db.get_players(
             game_id
         )
 
-        eligible = [
+        participants = [
             player
             for player in players
-            if self.is_counted_player(
-                player
-            )
+            if self.is_counted_player(player)
         ]
 
-        if not eligible:
+        if not participants:
+            # The generated story is intentionally kept in this cancelled
+            # game row. _get_reusable_empty_story() can reuse it later.
             await self.db.cancel_game_atomic(
                 game_id
             )
@@ -1502,7 +1220,7 @@ class GameService:
                 event_type="game_cancelled",
                 round_number=0,
                 payload={
-                    "reason": "empty_lobby",
+                    "reason": "empty_lobby_story_preserved_for_reuse"
                 },
             )
 
@@ -1512,55 +1230,35 @@ class GameService:
             return await self.start_game(
                 game_id=game_id
             )
-
         except DatabaseConflict:
-            # Another worker started it.
-            return await self.db.get_game(
-                game_id
-            )
+            return await self.db.get_game(game_id)
 
     async def recover_game(
         self,
         game: dict[str, Any],
     ) -> dict[str, Any] | None:
-        game_id = str(
-            game["id"]
-        )
-
-        status = game.get(
-            "status"
-        )
+        status = game.get("status")
 
         if status == self.STATUS_LOBBY:
             return await self.finish_lobby(
-                game_id
+                str(game["id"])
             )
 
         if status == self.STATUS_PLAYING:
             return await self.resolve_round_if_due(
-                game_id=game_id
+                game_id=str(game["id"])
             )
 
         if status == self.STATUS_RESOLVING:
-            # A previous worker may have died after claiming
-            # resolution. The database remains authoritative.
-            #
-            # Re-read the game and only attempt recovery when the
-            # stored resolution state permits it.
-            logger.info(
-                "Recovering resolving game %s",
-                game_id,
-            )
-
             refreshed = await self.db.get_game(
-                game_id
+                str(game["id"])
             )
 
             if not refreshed:
                 return None
 
             return await self.resolve_round_if_due(
-                game_id=game_id
+                game_id=str(game["id"])
             )
 
         return None
@@ -1568,21 +1266,14 @@ class GameService:
     async def recover_active_games(
         self,
     ) -> list[dict[str, Any]]:
-        games = await self.db.get_recoverable_games()
-
         results: list[dict[str, Any]] = []
 
-        for game in games:
+        for game in await self.db.get_recoverable_games():
             try:
-                result = await self.recover_game(
-                    game
-                )
+                result = await self.recover_game(game)
 
                 if result is not None:
-                    results.append(
-                        result
-                    )
-
+                    results.append(result)
             except Exception:
                 logger.exception(
                     "Failed to recover game %s",
@@ -1594,74 +1285,41 @@ class GameService:
     async def recover_all_due_games(
         self,
     ) -> list[dict[str, Any]]:
-        """
-        Recovery entry point for application startup.
-
-        The database supplies recoverable games. No Python
-        process-local timer is required.
-        """
-
         results: list[dict[str, Any]] = []
 
-        try:
-            pending_lobbies = (
-                await self.db.get_pending_lobbies()
-            )
+        for game in await self.db.get_pending_lobbies():
+            try:
+                result = await self.finish_lobby(
+                    str(game["id"])
+                )
 
-            for game in pending_lobbies:
-                try:
-                    result = await self.finish_lobby(
-                        game["id"]
-                    )
+                if result is not None:
+                    results.append(result)
+            except Exception:
+                logger.exception(
+                    "Failed to recover lobby %s",
+                    game.get("id"),
+                )
 
-                    if result:
-                        results.append(
-                            result
-                        )
+        for game in await self.db.get_expired_decision_games():
+            try:
+                result = await self.resolve_round_if_due(
+                    game_id=str(game["id"])
+                )
 
-                except Exception:
-                    logger.exception(
-                        "Failed to recover lobby %s",
-                        game.get("id"),
-                    )
-
-        except Exception:
-            logger.exception(
-                "Failed to recover pending lobbies."
-            )
-
-        try:
-            expired_games = (
-                await self.db.get_expired_decision_games()
-            )
-
-            for game in expired_games:
-                try:
-                    result = await self.resolve_round_if_due(
-                        game_id=game["id"]
-                    )
-
-                    if result:
-                        results.append(
-                            result
-                        )
-
-                except Exception:
-                    logger.exception(
-                        "Failed to recover expired game %s",
-                        game.get("id"),
-                    )
-
-        except Exception:
-            logger.exception(
-                "Failed to recover expired games."
-            )
+                if result is not None:
+                    results.append(result)
+            except Exception:
+                logger.exception(
+                    "Failed to recover expired game %s",
+                    game.get("id"),
+                )
 
         return results
 
-    # ============================================================
-    # ROLE / UI DATA
-    # ============================================================
+    # ------------------------------------------------------------------
+    # UI helpers
+    # ------------------------------------------------------------------
 
     async def get_player_role(
         self,
@@ -1669,10 +1327,7 @@ class GameService:
         game_id: str,
         user_id: int,
     ) -> dict[str, Any] | None:
-        game = await self.get_game(
-            game_id
-        )
-
+        game = await self.get_game(game_id)
         player = await self.db.get_player(
             game_id,
             user_id,
@@ -1681,18 +1336,12 @@ class GameService:
         if not player:
             return None
 
-        role_id = player.get(
-            "role_id"
-        )
+        role_id = player.get("role_id")
 
         if not role_id:
             return None
 
-        engine = self.engine_for_game(
-            game
-        )
-
-        return engine.get_role(
+        return self.engine_for_game(game).get_role(
             str(role_id)
         )
 
@@ -1702,10 +1351,7 @@ class GameService:
         game_id: str,
         user_id: int,
     ) -> list[dict[str, Any]]:
-        game = await self.get_game(
-            game_id
-        )
-
+        game = await self.get_game(game_id)
         player = await self.db.get_player(
             game_id,
             user_id,
@@ -1716,35 +1362,18 @@ class GameService:
                 "Player does not exist."
             )
 
-        role_id = player.get(
-            "role_id"
-        )
+        role_id = player.get("role_id")
+        scene_id = game.get("current_scene_id")
 
-        if not role_id:
+        if not role_id or not scene_id:
             return []
 
-        scene_id = game.get(
-            "current_scene_id"
-        )
-
-        if not scene_id:
-            return []
-
-        engine = self.engine_for_game(
-            game
-        )
-
-        scene = engine.get_scene(
-            scene_id
-        )
+        engine = self.engine_for_game(game)
+        scene = engine.get_scene(scene_id)
 
         world_state = (
-            game.get(
-                "world_state"
-            )
-            or await self.db.get_world_state(
-                game_id
-            )
+            game.get("world_state")
+            or await self.db.get_world_state(game_id)
             or engine.initial_world_state()
         )
 
@@ -1753,10 +1382,6 @@ class GameService:
             str(role_id),
             world_state,
         )
-
-    # ============================================================
-    # EVENTS
-    # ============================================================
 
     async def record_event(
         self,
