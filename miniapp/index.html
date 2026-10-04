@@ -1,153 +1,76 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
-  <meta name="theme-color" content="#08090d">
-  <meta name="color-scheme" content="dark">
-  <title>WHAT HAPPENS?</title>
-  <script src="https://telegram.org/js/telegram-web-app.js?63"></script>
-  <style>
-    :root{
-      --bg:#08090d;--surface:#0f1117;--surface2:#141821;--surface3:#1a1f2a;
-      --text:#f4f1ea;--muted:#9298a4;--dim:#5f6570;--line:rgba(255,255,255,.09);
-      --gold:#c8a66a;--gold2:#ead29d;--green:#6fd0a3;--red:#e46f78;--blue:#7e96b8;
-      --shadow:0 24px 80px rgba(0,0,0,.42);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif
-    }
-    *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-    html,body{margin:0;background:var(--bg);color:var(--text);min-height:100%;overflow-x:hidden}
-    body{
-      background:
-        radial-gradient(900px 500px at 15% -10%,rgba(200,166,106,.10),transparent 65%),
-        radial-gradient(850px 520px at 110% 20%,rgba(85,105,145,.11),transparent 65%),
-        linear-gradient(180deg,#090a0f 0%,#07080c 100%);
-    }
-    button,input{font:inherit}
-    button{cursor:pointer}
-    .grain{position:fixed;inset:0;pointer-events:none;opacity:.035;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120' viewBox='0 0 120 120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.8'/%3E%3C/svg%3E")}
-    .app{position:relative;z-index:1;width:min(760px,100%);margin:auto;padding:calc(16px + env(safe-area-inset-top)) 16px calc(104px + env(safe-area-inset-bottom))}
-    .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
-    .brand{display:flex;align-items:center;gap:12px}.mark{width:44px;height:44px;border:1px solid rgba(234,210,157,.28);border-radius:13px;display:grid;place-items:center;color:var(--gold2);font-weight:900;letter-spacing:-.08em;background:linear-gradient(145deg,#1a1814,#0f1117);box-shadow:0 12px 35px rgba(0,0,0,.35)}
-    .eyebrow{font-size:9px;letter-spacing:.22em;font-weight:850;color:var(--gold);text-transform:uppercase}.brand h1{font-size:16px;margin:3px 0 0;letter-spacing:.02em}
-    .top-actions{display:flex;gap:8px}.icon{width:42px;height:42px;border-radius:50%;border:1px solid var(--line);background:#101319;color:#e7e2d7}
-    .panel{border:1px solid var(--line);border-radius:26px;background:linear-gradient(150deg,rgba(22,25,33,.97),rgba(12,14,19,.97));box-shadow:var(--shadow);padding:18px;margin-bottom:12px}
-    .hidden{display:none!important}.loading{display:flex;align-items:center;gap:13px;min-height:84px}.loading b{font-size:13px}.loading span{display:block;color:var(--muted);font-size:10px;margin-top:4px}.spinner{width:18px;height:18px;border:2px solid #30343d;border-top-color:var(--gold);border-radius:50%;animation:spin .7s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
-    .hero{position:relative;overflow:hidden;padding:30px 22px;background:radial-gradient(600px 280px at 100% 0,rgba(200,166,106,.13),transparent 70%),linear-gradient(145deg,#171a21,#0c0e13)}
-    .hero:after{content:"";position:absolute;right:-80px;bottom:-120px;width:260px;height:260px;border:1px solid rgba(200,166,106,.13);border-radius:50%;box-shadow:0 0 0 36px rgba(200,166,106,.025),0 0 0 72px rgba(200,166,106,.018)}
-    .hero h2{position:relative;z-index:1;font-family:Georgia,"Times New Roman",serif;font-size:46px;line-height:.96;letter-spacing:-.055em;font-weight:500;margin:11px 0 16px;max-width:620px}
-    .hero p{position:relative;z-index:1;color:#c4c6ca;font-size:14px;line-height:1.75;max-width:620px;margin:0 0 18px}.hero-note{position:relative;z-index:1;border-left:2px solid var(--gold);padding:10px 0 10px 13px;color:#a9adb5;font-size:10px;line-height:1.6;max-width:620px}
-    .feature-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.mini{padding:15px;border:1px solid var(--line);border-radius:19px;background:#0d1016}.mini .num{font-family:Georgia,serif;color:var(--gold2);font-size:23px}.mini b{display:block;font-size:12px;margin-top:12px}.mini small{display:block;color:var(--muted);font-size:9px;line-height:1.5;margin-top:5px}
-    .world-head{display:flex;align-items:flex-start;justify-content:space-between;padding:16px 18px}.world-head h2{font-family:Georgia,serif;font-size:27px;font-weight:500;margin:4px 0 5px;letter-spacing:-.035em}.location{display:flex;gap:7px;color:#a2a6af;font-size:10px}.location i{color:#4c515a;font-style:normal}.status{padding:6px 9px;border-radius:999px;border:1px solid var(--line);font-size:8px;font-weight:900;letter-spacing:.16em}.status.live{color:var(--green);border-color:rgba(111,208,163,.2);background:rgba(111,208,163,.05)}.status.waiting{color:var(--gold2);border-color:rgba(200,166,106,.22);background:rgba(200,166,106,.05)}
-    .lobby{background:linear-gradient(145deg,#15181e,#0d0f14)}.lobby-head{display:flex;justify-content:space-between;align-items:center}.lobby h3{font-family:Georgia,serif;font-size:22px;font-weight:500;margin:4px 0}.countdown{min-width:74px;text-align:center;padding:9px 10px;border:1px solid var(--line);border-radius:16px;background:#0a0c10}.countdown b{display:block;font-size:27px;font-weight:600}.countdown span{font-size:8px;color:var(--muted);letter-spacing:.16em}
-    .muted{color:var(--muted);font-size:10px;line-height:1.7}.section{display:flex;align-items:center;justify-content:space-between;margin:17px 0 10px}.section h3{font-size:15px;margin:4px 0 0}.badge{min-width:31px;height:31px;border-radius:10px;display:grid;place-items:center;background:#1b1f27;color:#ddd7cb;font-weight:800}
-    .roster{display:grid;gap:7px}.player{display:flex;align-items:center;gap:10px;padding:10px;border:1px solid var(--line);border-radius:15px;background:#0c0f14}.avatar{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;background:linear-gradient(145deg,#3a3d45,#1c2028);border:1px solid rgba(255,255,255,.08);font-size:11px;font-weight:900;color:#ece6da}.pname{flex:1;min-width:0}.pname b{display:block;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pname small{display:block;color:var(--muted);font-size:8px;margin-top:3px}.dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 0 4px rgba(111,208,163,.06)}
-    .pause{display:flex;gap:13px;align-items:flex-start}.pause-symbol{width:43px;height:43px;border-radius:14px;display:grid;place-items:center;color:var(--gold2);background:#19150f;border:1px solid rgba(200,166,106,.16);font-weight:900}.pause h3{font-family:Georgia,serif;font-size:21px;font-weight:500;margin:2px 0 5px}
-    .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}.stat{padding:11px;border:1px solid var(--line);border-radius:15px;background:#0c0f14}.stat span{display:block;color:var(--muted);font-size:7px;letter-spacing:.13em;font-weight:900}.stat b{display:block;font-size:17px;margin-top:4px}.meter{height:4px;background:#242831;border-radius:99px;margin:7px 1px 12px;overflow:hidden}.meter span{display:block;height:100%;width:100%;background:linear-gradient(90deg,#8a6c43,#d9bd7d);transition:width .12s linear}
-    .story{padding:22px;background:radial-gradient(600px 250px at 100% 0,rgba(200,166,106,.10),transparent 68%),linear-gradient(145deg,#171a20,#0c0e13)}.story-meta{display:flex;gap:7px;align-items:center;margin-bottom:12px}.tag{padding:5px 8px;border-radius:7px;background:#20242c;color:#bfc3ca;font-size:8px;font-weight:900;letter-spacing:.13em}.meet{padding:5px 8px;border-radius:7px;background:rgba(111,208,163,.07);color:var(--green);font-size:8px;font-weight:900;letter-spacing:.13em}.story h2{font-family:Georgia,serif;font-size:34px;line-height:1.05;font-weight:500;letter-spacing:-.045em;margin:0 0 13px}.story p{font-size:15px;line-height:1.78;color:#dedbd4;margin:0}.npc{margin-top:17px;padding-top:13px;border-top:1px solid var(--line);color:#9da1aa;font-size:10px}
-    .choices{display:grid;gap:8px;margin:10px 0 14px}.choice{position:relative;display:grid;grid-template-columns:34px 1fr 18px;gap:10px;align-items:center;text-align:left;width:100%;min-height:76px;padding:12px;border:1px solid var(--line);border-radius:18px;background:linear-gradient(145deg,#15181e,#0d0f14);color:var(--text);transition:transform .06s,border-color .08s}.choice:active,.choice.pressed{transform:scale(.986);border-color:rgba(200,166,106,.45)}.choice:disabled{opacity:.62}.idx{width:29px;height:29px;border-radius:9px;display:grid;place-items:center;background:#20242b;color:var(--gold2);font-size:10px;font-weight:900}.copy b{display:block;font-size:12px;line-height:1.25}.copy small{display:block;color:var(--muted);font-size:9px;line-height:1.5;margin-top:4px}.arrow{font-size:23px;color:#5e636c}
-    .subhead{display:block;margin-top:18px}.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.chip{padding:6px 9px;border-radius:999px;background:#191d24;color:#c9c5bb;font-size:9px}.chip.dim{color:#a5a9b0}
-    .setting{width:100%;display:flex;align-items:center;justify-content:space-between;text-align:left;border:1px solid var(--line);border-radius:16px;background:#0c0f14;color:var(--text);padding:13px}.setting:disabled{opacity:.5}.setting b{display:block;font-size:11px}.setting small{display:block;color:var(--muted);font-size:8px;margin-top:4px}.setting strong{font-size:9px;color:var(--green)}.controls{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:7px}.secondary,.danger{border:1px solid var(--line);border-radius:14px;padding:12px;background:#141820;color:#ece8df;font-weight:800}.secondary:disabled{opacity:.45}.danger{width:100%;margin-top:10px;color:#f1a3aa;border-color:rgba(228,111,120,.2);background:rgba(228,111,120,.05)}
-    .operator{margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}.operator-row{display:grid;grid-template-columns:1fr auto auto;gap:6px;margin-top:8px}.operator input{min-width:0;border:1px solid var(--line);border-radius:13px;background:#0a0d12;color:var(--text);padding:11px;outline:none}.tiny{display:block;color:var(--muted);font-size:8px;line-height:1.5;margin-top:6px}
-    .bottom{position:fixed;left:50%;bottom:calc(10px + env(safe-area-inset-bottom));transform:translateX(-50%);width:min(540px,calc(100% - 30px));display:grid;grid-template-columns:repeat(3,1fr);gap:4px;padding:6px;border:1px solid var(--line);border-radius:22px;background:rgba(9,10,14,.92);backdrop-filter:blur(20px);box-shadow:0 18px 50px rgba(0,0,0,.55);z-index:20}.bottom button{border:0;border-radius:15px;background:transparent;color:#777c85;padding:8px 4px;font-size:9px;font-weight:850}.bottom button span{display:block;font-size:14px;margin-bottom:2px}.bottom button.active{background:#1b1e25;color:#e9e4d9}
-    .toast{position:fixed;left:15px;right:15px;bottom:calc(82px + env(safe-area-inset-bottom));z-index:30;padding:13px 15px;border:1px solid var(--line);border-radius:15px;background:#181b22;box-shadow:0 18px 50px rgba(0,0,0,.45);font-size:10px}.toast.good{color:#bce7d4;border-color:rgba(111,208,163,.25)}.toast.bad{color:#f3bcc0;border-color:rgba(228,111,120,.28)}
-    @media(min-width:650px){.app{padding-top:28px}.story h2{font-size:40px}.hero h2{font-size:58px}}
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#080a0f">
+<meta name="color-scheme" content="dark">
+<title>WHAT HAPPENS?</title>
+<script src="https://telegram.org/js/telegram-web-app.js?63"></script>
+<style>
+:root{--bg:#07090d;--panel:#0e131b;--panel2:#121923;--text:#f4f1e9;--muted:#929aaa;--gold:#d6b777;--cyan:#78c9d9;--violet:#9c83ff;--green:#6fdaaa;--red:#ef777f;--line:rgba(255,255,255,.09);--shadow:0 24px 80px rgba(0,0,0,.55);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);overflow-x:hidden}button{font:inherit;color:inherit}button:active{transform:scale(.985)}.hidden{display:none!important}
+body{background:radial-gradient(900px 550px at 20% -10%,rgba(156,131,255,.12),transparent 65%),radial-gradient(700px 500px at 110% 30%,rgba(120,201,217,.08),transparent 65%),#07090d}.app{width:min(100%,900px);margin:auto;padding:calc(10px + env(safe-area-inset-top)) 12px calc(98px + env(safe-area-inset-bottom));position:relative}
+.top{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px 4px 12px;position:sticky;top:0;z-index:20;background:linear-gradient(#07090df2,#07090dca,transparent);backdrop-filter:blur(12px)}.brand{display:flex;gap:10px;align-items:center}.logo{width:42px;height:42px;border-radius:14px;background:linear-gradient(145deg,#8e75ff,#4e75c9);display:grid;place-items:center;font-weight:950;box-shadow:0 10px 35px rgba(120,100,255,.28)}.eyebrow{font-size:8px;letter-spacing:.22em;color:#a9b2c6;font-weight:900}.brand h1{margin:2px 0 0;font-size:15px;letter-spacing:.03em}.top-actions{display:flex;gap:7px}.circle{width:40px;height:40px;border:1px solid var(--line);border-radius:50%;background:#0e131b;display:grid;place-items:center;font-size:16px}
+.hero{position:relative;min-height:460px;border:1px solid var(--line);border-radius:30px;overflow:hidden;box-shadow:var(--shadow);background:#101620}.scene-art{position:absolute;inset:0;background:radial-gradient(400px 230px at 74% 20%,rgba(211,183,119,.24),transparent 55%),radial-gradient(350px 300px at 20% 65%,rgba(89,113,180,.25),transparent 62%),linear-gradient(155deg,#182131 0%,#10151e 42%,#080a0e 100%)}.scene-art:before{content:"";position:absolute;inset:0;background:linear-gradient(110deg,transparent 0 32%,rgba(255,255,255,.035) 32.5%,transparent 33% 58%,rgba(255,255,255,.025) 58.5%,transparent 59%),radial-gradient(180px 80px at 65% 58%,rgba(214,183,119,.12),transparent 70%)}.scene-art:after{content:"";position:absolute;width:420px;height:420px;border:1px solid rgba(214,183,119,.10);border-radius:50%;right:-190px;top:-110px;box-shadow:0 0 0 42px rgba(214,183,119,.025),0 0 0 84px rgba(214,183,119,.018)}
+.hero-content{position:relative;z-index:2;min-height:460px;padding:22px;display:flex;flex-direction:column;justify-content:space-between;background:linear-gradient(180deg,rgba(5,7,10,.28),transparent 30%,rgba(5,7,10,.85) 78%,rgba(5,7,10,.96))}.location-line{display:flex;gap:7px;align-items:center;color:#c9ced9;font-size:10px;text-transform:uppercase;letter-spacing:.13em;font-weight:850}.location-line b{color:var(--gold)}.status{padding:5px 8px;border-radius:999px;border:1px solid var(--line);font-size:7px;letter-spacing:.15em;background:#090d13aa}.status.live{color:var(--green)}.status.waiting{color:var(--gold)}.status.paused{color:#f4c879}.title{font-family:Georgia,"Times New Roman",serif;font-size:48px;line-height:.92;letter-spacing:-.06em;font-weight:500;max-width:680px;margin:14px 0 12px}.scene-copy{max-width:690px;color:#e1ded7;font-size:15px;line-height:1.75}.npc-line{margin-top:13px;color:#aeb6c4;font-size:10px}.npc-line b{color:#e9d5a4}
+.hud{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-top:18px}.hud-box{background:rgba(11,15,21,.82);border:1px solid var(--line);border-radius:15px;padding:9px 10px;backdrop-filter:blur(10px)}.hud-box span{display:block;font-size:7px;color:#858e9f;letter-spacing:.14em;font-weight:900}.hud-box b{display:block;font-size:17px;margin-top:3px}.bar{height:3px;border-radius:99px;background:#252c37;margin-top:6px;overflow:hidden}.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--gold),#f1d69c);width:100%}
+.lobby{border:1px solid var(--line);border-radius:24px;background:linear-gradient(145deg,#121923,#0a0e14);padding:18px;margin-top:12px}.lobby-top{display:flex;justify-content:space-between;gap:12px}.lobby h2{font-family:Georgia,serif;font-size:28px;font-weight:500;margin:0 0 6px}.muted{color:var(--muted);font-size:10px;line-height:1.65}.timer{min-width:74px;text-align:center;padding:9px;border:1px solid var(--line);border-radius:15px;background:#080c11}.timer b{font-size:25px}.timer small{display:block;color:#7f8795;font-size:7px;letter-spacing:.16em}.roster{display:grid;grid-template-columns:repeat(2,1fr);gap:7px;margin-top:14px}.player{display:flex;gap:9px;align-items:center;border:1px solid var(--line);background:#0a0f15;border-radius:14px;padding:9px}.avatar{width:32px;height:32px;border-radius:10px;background:linear-gradient(145deg,#29334a,#171e2b);display:grid;place-items:center;font-weight:900;font-size:10px}.player b{font-size:10px}.player small{display:block;color:#7d8797;font-size:7px;margin-top:3px}.dot{margin-left:auto;width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 0 4px rgba(111,218,170,.06)}
+.actions{margin-top:12px;display:grid;gap:8px}.action{min-height:70px;border:1px solid rgba(255,255,255,.09);border-radius:18px;background:linear-gradient(145deg,#141b25,#0c1118);display:grid;grid-template-columns:44px 1fr 20px;align-items:center;text-align:left;padding:10px 12px;transition:.08s}.action:hover{border-color:rgba(214,183,119,.34)}.action:disabled{opacity:.5}.action-icon{width:38px;height:38px;border-radius:12px;background:#1a2230;display:grid;place-items:center;color:var(--gold);font-size:17px}.action b{font-size:12px}.action small{display:block;color:#818b9b;font-size:9px;line-height:1.45;margin-top:3px}.arrow{color:#697382;font-size:22px}
+.section{margin-top:12px;border:1px solid var(--line);border-radius:22px;background:#0b1017;padding:16px}.section-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}.section h3{font-family:Georgia,serif;font-size:21px;font-weight:500;margin:0}.pill{font-size:7px;letter-spacing:.15em;padding:6px 8px;border-radius:999px;background:#151d28;color:#9da7b8}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.tile{padding:12px;border:1px solid var(--line);border-radius:16px;background:#0d131c}.tile b{display:block;font-size:11px}.tile small{display:block;color:#7e8898;font-size:8px;line-height:1.5;margin-top:5px}.stat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}.stat{padding:11px;border:1px solid var(--line);border-radius:14px;background:#0d131c}.stat span{display:block;color:#7e8795;font-size:7px;letter-spacing:.12em}.stat b{font-size:18px;display:block;margin-top:4px}.chip-row{display:flex;flex-wrap:wrap;gap:6px}.chip{padding:7px 9px;border-radius:999px;background:#171f2a;color:#c6cedb;font-size:8px}.empty{padding:18px;border:1px dashed var(--line);border-radius:15px;color:#777f8c;font-size:9px;text-align:center}
+.bottom{position:fixed;left:50%;bottom:calc(9px + env(safe-area-inset-bottom));transform:translateX(-50%);width:min(680px,calc(100% - 22px));display:grid;grid-template-columns:repeat(5,1fr);gap:4px;padding:5px;border:1px solid var(--line);border-radius:22px;background:rgba(8,11,16,.93);backdrop-filter:blur(20px);box-shadow:0 18px 55px rgba(0,0,0,.55);z-index:30}.nav{border:0;background:transparent;border-radius:16px;color:#70798a;padding:7px 2px;font-size:7px;font-weight:900}.nav span{display:block;font-size:15px;margin-bottom:2px}.nav.active{background:#171e2a;color:#f0e9dc}.toast{position:fixed;left:12px;right:12px;bottom:calc(86px + env(safe-area-inset-bottom));z-index:40;padding:12px 14px;border:1px solid var(--line);border-radius:15px;background:#171d27;box-shadow:var(--shadow);font-size:10px}.toast.bad{border-color:rgba(239,119,127,.3);color:#f3b7bd}.toast.good{border-color:rgba(111,218,170,.3);color:#bce8d5}.maintenance{padding:28px;text-align:center;border:1px solid var(--line);border-radius:25px;background:linear-gradient(145deg,#151b25,#0b1017)}.maintenance h2{font-family:Georgia,serif;font-size:34px;margin:0 0 10px}.maintenance .clock{font-size:28px;color:var(--gold);margin:14px 0}
+@media(min-width:700px){.title{font-size:64px}.hero{min-height:560px}.hero-content{min-height:560px}.roster{grid-template-columns:repeat(3,1fr)}}
+</style>
 </head>
 <body>
-<div class="grain"></div>
 <main class="app">
-  <header class="topbar">
-    <div class="brand">
-      <div class="mark">WH</div>
-      <div><div class="eyebrow">YOUR OWN VISION</div><h1>WHAT HAPPENS?</h1></div>
+<header class="top"><div class="brand"><div class="logo">WH</div><div><div class="eyebrow">YOUR OWN VISION</div><h1>WHAT HAPPENS?</h1></div></div><div class="top-actions"><button id="sound" class="circle">◉</button><button id="invite" class="circle">＋</button></div></header>
+<section id="loading" class="section"><div class="muted">Entering the world…</div></section>
+<section id="maintenance" class="maintenance hidden"><div style="font-size:36px">🛠</div><h2>Worlds are being maintained.</h2><div class="muted">Your saved worlds and player runs are safe. No story generation is running during maintenance.</div><div id="maintClock" class="clock">—</div></section>
+<section id="game" class="hidden">
+  <div class="hero"><div class="scene-art"></div><div class="hero-content">
+    <div><div class="location-line"><span id="dimension">UNKNOWN</span><span>·</span><b id="location">UNKNOWN</b><span id="status" class="status live">LIVE</span></div></div>
+    <div><div id="category" class="eyebrow">WORLD EVENT</div><h2 id="title" class="title">A world is waiting.</h2><div id="copy" class="scene-copy">The city has not decided what it wants from you yet.</div><div id="npc" class="npc-line"></div>
+      <div class="hud"><div class="hud-box"><span>HEALTH</span><b id="health">100</b><div class="bar"><i id="healthBar"></i></div></div><div class="hud-box"><span>ENERGY</span><b id="energy">100</b><div class="bar"><i id="energyBar"></i></div></div><div class="hud-box"><span>CHANCES</span><b id="lives">3</b></div><div class="hud-box"><span>WORLD TURN</span><b id="turn">0</b></div></div>
     </div>
-    <div class="top-actions">
-      <button id="soundBtn" class="icon" type="button" aria-label="Sound">◉</button>
-      <button id="inviteBtn" class="icon" type="button" aria-label="Invite">＋</button>
-    </div>
-  </header>
-
-  <section id="statusCard" class="panel loading">
-    <div class="spinner"></div>
-    <div><b>ENTERING WORLD</b><span>Verifying your Telegram session…</span></div>
-  </section>
-
-  <section id="home" class="hidden">
-    <div class="panel hero">
-      <div class="eyebrow">A LIVING MULTIPLAYER STORY</div>
-      <h2 id="homeTitle">The world is waiting.</h2>
-      <p>Your group shares one persistent world. Your decisions create a personal route, while the wider world remembers consequences and periodically pulls players into the same turning points.</p>
-      <div class="hero-note">Use <b>/play</b> in a group. The bot creates the group world automatically. Opening this screen never creates or resets a world.</div>
-    </div>
-    <div class="feature-grid">
-      <article class="mini"><div class="num">01</div><b>CONTINUOUS</b><small>No forced story rounds. The world survives restarts and deployments.</small></article>
-      <article class="mini"><div class="num">02</div><b>RELATIONSHIPS</b><small>People react to your history, risks and promises.</small></article>
-      <article class="mini"><div class="num">03</div><b>CONVERGENCE</b><small>Separate paths meet at shared events instead of becoming separate games.</small></article>
-    </div>
-  </section>
-
-  <section id="world" class="hidden">
-    <div class="panel world-head">
-      <div><div class="eyebrow">LIVE WORLD</div><h2 id="worldTitle">WHAT HAPPENS?</h2><div class="location"><span id="dimension">Unknown</span><i>•</i><span id="location">Unknown</span></div></div>
-      <span id="worldStatus" class="status live">LIVE</span>
-    </div>
-
-    <section id="lobbyPanel" class="panel lobby hidden">
-      <div class="lobby-head">
-        <div><div class="eyebrow">ENTRY WINDOW</div><h3>Players are arriving.</h3></div>
-        <div class="countdown"><b id="lobbyTimer">45</b><span>SECONDS</span></div>
-      </div>
-      <p class="muted">The clock only controls the entry window. The world itself has no round timer and remains saved after the lobby closes.</p>
-      <div class="section"><div><div class="eyebrow">ROSTER</div><h3>Players</h3></div><span id="playerCount" class="badge">0</span></div>
-      <div id="lobbyPlayers" class="roster"></div>
-    </section>
-
-    <section id="pausedPanel" class="panel pause hidden">
-      <div class="pause-symbol">Ⅱ</div>
-      <div><div class="eyebrow">WORLD PAUSED</div><h3>The story is waiting.</h3><p class="muted">No progress was deleted. An authorized moderator can resume the same world.</p></div>
-    </section>
-
-    <section id="storyPanel" class="hidden">
-      <div class="stats">
-        <div class="stat"><span>CHANCES</span><b id="lifeText">3</b></div>
-        <div class="stat"><span>HEALTH</span><b id="health">100</b></div>
-        <div class="stat"><span>ENERGY</span><b id="energy">100</b></div>
-        <div class="stat"><span>WORLD TURN</span><b id="worldTurn">0</b></div>
-      </div>
-      <div class="meter"><span id="healthBar"></span></div>
-
-      <article class="panel story">
-        <div class="story-meta"><span id="sceneCategory" class="tag">STORY</span><span id="sceneConvergence" class="meet hidden">EVERYONE MEETS</span></div>
-        <h2 id="sceneTitle">—</h2>
-        <p id="sceneText">—</p>
-        <div id="npcLine" class="npc"></div>
-      </article>
-      <div id="choices" class="choices"></div>
-    </section>
-
-    <section id="peoplePanel" class="panel hidden">
-      <div class="section"><div><div class="eyebrow">THIS WORLD</div><h3>People</h3></div><span id="peopleCount" class="badge">0</span></div>
-      <div id="peopleList" class="roster"></div>
-      <div class="eyebrow subhead">YOUR RELATIONSHIPS</div><div id="relationships" class="chips"></div>
-      <div class="eyebrow subhead">DISCOVERED DIMENSIONS</div><div id="discoveries" class="chips"></div>
-    </section>
-
-    <section id="settingsPanel" class="panel hidden">
-      <div class="section"><div><div class="eyebrow">CONTROL ROOM</div><h3>World settings</h3></div></div>
-      <button id="toggleInvites" class="setting"><span><b>OUTSIDE INVITES</b><small>Allow players who are not in the group to enter.</small></span><strong id="inviteSetting">ON</strong></button>
-      <div class="controls"><button id="pauseBtn" class="secondary">Pause</button><button id="resumeBtn" class="secondary">Resume</button></div>
-      <div id="terminateWrap" class="hidden"><button id="terminateBtn" class="danger">Terminate world</button><small class="tiny">Only the world creator or bot creator can terminate. Group admins cannot.</small></div>
-      <div id="operatorWrap" class="operator hidden"><div class="eyebrow">ASSIGNED OPERATORS</div><div class="operator-row"><input id="operatorId" inputmode="numeric" placeholder="Telegram user ID"><button id="operatorAdd" class="secondary">Add</button><button id="operatorRemove" class="secondary">Remove</button></div><small class="tiny">Operators can pause/resume but cannot terminate.</small></div>
-    </section>
-  </section>
-
-  <nav id="bottomNav" class="bottom hidden">
-    <button data-tab="story" class="active"><span>◈</span>Story</button>
-    <button data-tab="people"><span>♧</span>People</button>
-    <button id="settingsNav" data-tab="settings" class="hidden"><span>⚙</span>Control</button>
-  </nav>
-  <div id="toast" class="toast hidden"></div>
+  </div></div>
+  <section id="lobby" class="lobby hidden"><div class="lobby-top"><div><div class="eyebrow">WORLD LOBBY</div><h2>Gather your party.</h2><div class="muted">The 45-second clock is only for joining. Once the world begins, there are no forced rounds.</div></div><div class="timer"><b id="timer">45</b><small>SECONDS</small></div></div><div id="rosterLobby" class="roster"></div></section>
+  <section id="story" class="section"><div class="section-head"><h3>What can you do?</h3><span id="convergence" class="pill hidden">SHARED MOMENT</span></div><div id="actions" class="actions"></div></section>
+  <section id="panel" class="section hidden"></section>
+</section>
+<div id="toast" class="toast hidden"></div>
+<nav id="nav" class="bottom hidden"><button class="nav active" data-tab="world"><span>◈</span>WORLD</button><button class="nav" data-tab="character"><span>♙</span>CHARACTER</button><button class="nav" data-tab="relationships"><span>♥</span>RELATIONS</button><button class="nav" data-tab="map"><span>◇</span>MAP</button><button id="settingsNav" class="nav hidden" data-tab="settings"><span>⚙</span>CONTROL</button></nav>
 </main>
-<script src="/app/assets/app.js"></script>
+<script>
+(()=>{
+const tg=window.Telegram?.WebApp; tg?.ready(); tg?.expand(); tg?.disableVerticalSwipes?.(); tg?.setHeaderColor?.('#080a0f'); tg?.setBackgroundColor?.('#080a0f');
+const $=id=>document.getElementById(id); const initData=tg?.initData||''; let snapshot=null,permissions={},busy=false,soundOn=true,activeTab='world',poll=null,deadline=0;
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+async function api(path,options={}){const headers={'Content-Type':'application/json','X-Telegram-Init-Data':initData,'X-MiniApp-Start-Param':tg?.initDataUnsafe?.start_param||new URLSearchParams(location.search).get('startapp')||'',...(options.headers||{})};const r=await fetch(path,{...options,headers,cache:'no-store',credentials:'same-origin'});let d={};try{d=await r.json()}catch{}if(!r.ok)throw new Error(d.detail||`Request failed (${r.status})`);return d}
+function toast(text,kind='good'){const n=$('toast');n.textContent=text;n.className=`toast ${kind}`;clearTimeout(toast.t);toast.t=setTimeout(()=>n.classList.add('hidden'),3200)}
+function haptic(x='light'){try{tg?.HapticFeedback?.impactOccurred(x)}catch{}}
+function tone(freq=520,d=.05){if(!soundOn)return;try{const C=window.AudioContext||window.webkitAudioContext;if(!C)return;const c=tone.c||(tone.c=new C());if(c.state==='suspended')c.resume();const o=c.createOscillator(),g=c.createGain();o.frequency.value=freq;o.type='sine';g.gain.setValueAtTime(.02,c.currentTime);g.gain.exponentialRampToValueAtTime(.0001,c.currentTime+d);o.connect(g);g.connect(c.destination);o.start();o.stop(c.currentTime+d)}catch{}}
+function initials(n){return String(n||'P').trim().slice(0,1).toUpperCase()}
+function roster(players){if(!players?.length)return '<div class="empty">No one has entered yet. Be the first.</div>';return players.map(p=>`<div class="player"><div class="avatar">${esc(initials(p.display_name))}</div><div><b>${esc(p.display_name||'Player')}</b><small>${p.status==='alive'?'IN WORLD':'RUN ENDED'}</small></div><i class="dot"></i></div>`).join('')}
+function renderSnapshot(data){snapshot=data; const g=data.game||{},w=data.world||{},p=data.player?.state||{}; const status=g.status||'active'; $('loading').classList.add('hidden');$('maintenance').classList.toggle('hidden',!data.maintenance);$('game').classList.toggle('hidden',!!data.maintenance);$('nav').classList.toggle('hidden',!!data.maintenance); if(data.maintenance){$('maintClock').textContent=formatSeconds(data.maintenance.seconds_remaining);return}
+$('dimension').textContent=(w.dimension||'UNKNOWN').toUpperCase();$('location').textContent=(w.location||'UNKNOWN').toUpperCase();$('turn').textContent=w.turn??0;$('health').textContent=p.health??100;$('energy').textContent=p.energy??100;$('lives').textContent=p.lives??3;$('healthBar').style.width=`${Math.max(0,Math.min(100,p.health??100))}%`;$('energyBar').style.width=`${Math.max(0,Math.min(100,p.energy??100))}%`;
+$('status').textContent=status==='waiting'?'LOBBY':status==='paused'?'PAUSED':status==='archived'?'ENDED':'LIVE';$('status').className=`status ${status==='waiting'?'waiting':status==='paused'?'paused':'live'}`;
+$('lobby').classList.toggle('hidden',status!=='waiting');$('rosterLobby').innerHTML=roster(data.players||[]);deadline=g.join_deadline?new Date(g.join_deadline).getTime():0;renderStory();renderPanel();$('nav').classList.toggle('hidden',!data.player||!!data.maintenance);}
+function renderStory(){if(!snapshot)return;const g=snapshot.game||{},s=snapshot.scene;if(g.status!=='active'||!s){$('category').textContent=g.status==='paused'?'WORLD PAUSED':'WORLD LOBBY';$('title').textContent=g.status==='paused'?'The world is frozen.':'Gather your party.';$('copy').textContent=g.status==='paused'?'A permitted operator can resume the world. Your state remains stored in Supabase.':'The 45-second clock is only for joining. When the world begins, time is yours.';$('npc').textContent='';$('actions').innerHTML='';$('convergence').classList.add('hidden');return}
+$('category').textContent=String(s.category||'WORLD EVENT').toUpperCase();$('title').textContent=s.title||'The next moment';$('copy').textContent=s.text||'';$('npc').innerHTML=s.npc?`<b>${esc(s.npc.name)}</b> · ${esc(s.npc.role)} · bond ${s.npc.bond}`:'';$('convergence').classList.toggle('hidden',!s.convergence);$('actions').innerHTML=(s.choices||[]).map((c,i)=>`<button class="action" data-choice="${esc(c.id)}"><span class="action-icon">${['✦','◌','⚔','♥','◈','◇'][i%6]}</span><span><b>${esc(c.label)}</b><small>${esc(c.preview)}</small></span><span class="arrow">›</span></button>`).join('');document.querySelectorAll('[data-choice]').forEach(b=>b.onclick=()=>choose(b.dataset.choice));}
+function renderPanel(){const panel=$('panel');panel.classList.toggle('hidden',activeTab==='world');if(activeTab==='world')return;const p=snapshot?.player?.state||{},w=snapshot?.world||{},players=snapshot?.players||[];if(activeTab==='character'){const stats=p.stats||{};panel.innerHTML=`<div class="section-head"><h3>Your character</h3><span class="pill">CYCLE ${p.cycle??0}</span></div><div class="stat-grid">${Object.entries(stats).map(([k,v])=>`<div class="stat"><span>${esc(k)}</span><b>${v}</b></div>`).join('')}</div><div class="section-head" style="margin-top:16px"><h3>Inventory</h3></div><div class="chip-row">${(p.inventory||[]).map(x=>`<span class="chip">${esc(x)}</span>`).join('')||'<span class="muted">Empty.</span>'}</div>`}
+if(activeTab==='relationships'){const rel=p.relationships||{};panel.innerHTML=`<div class="section-head"><h3>People</h3><span class="pill">${players.length} PLAYERS</span></div><div class="grid">${players.map(x=>`<div class="tile"><b>${esc(x.display_name)}</b><small>${x.status==='alive'?'Currently travelling this world.':'Their current run has ended.'}</small></div>`).join('')||'<div class="empty">No players yet.</div>'}</div><div class="section-head" style="margin-top:16px"><h3>Relationships</h3></div><div class="chip-row">${Object.entries(rel).map(([k,v])=>`<span class="chip">${esc(k)} ${Number(v)>=0?'+':''}${v}</span>`).join('')||'<span class="muted">Relationships emerge from what you do, not from a questionnaire.</span>'}</div>`}
+if(activeTab==='map'){panel.innerHTML=`<div class="section-head"><h3>World map</h3><span class="pill">TURN ${w.turn??0}</span></div><div class="grid">${(w.locations||w.discoveries||[]).map(x=>`<div class="tile"><b>${esc(x)}</b><small>Discovered location</small></div>`).join('')||'<div class="empty">The map is still unfolding.</div>'}</div><div class="section-head" style="margin-top:16px"><h3>Dimensions</h3></div><div class="chip-row">${(w.discoveries||[]).map(x=>`<span class="chip">${esc(x)}</span>`).join('')}</div>`}
+if(activeTab==='settings'){const g=snapshot.game||{};panel.innerHTML=`<div class="section-head"><h3>World control</h3><span class="pill">${permissions.can_moderate?'OPERATOR':'PLAYER'}</span></div>${permissions.can_moderate?`<div class="grid"><button class="tile" id="pauseControl"><b>Pause world</b><small>Freeze actions without deleting progress.</small></button><button class="tile" id="resumeControl"><b>Resume world</b><small>Continue the persistent timeline.</small></button></div>`:'<div class="empty">Only the group owner/admin, assigned operator, or creator can control the world. Only the world creator can terminate it.</div>'}<div class="section-head" style="margin-top:16px"><h3>External invites</h3><span class="pill">${g.settings?.allow_external_invites===false?'OFF':'ON'}</span></div><div class="muted">Inviting people outside this group is controlled by group admins.</div>`;const pb=document.getElementById('pauseControl');const rb=document.getElementById('resumeControl');if(pb)pb.onclick=()=>moderate('/api/miniapp/moderation/pause');if(rb)rb.onclick=()=>moderate('/api/miniapp/moderation/resume');}}
+function formatSeconds(s){s=Math.max(0,Math.floor(s||0));return `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`}
+async function choose(id){if(busy)return;busy=true;haptic('medium');tone(700);document.querySelectorAll('[data-choice]').forEach(b=>b.disabled=true);try{const r=await api('/api/miniapp/choice',{method:'POST',body:JSON.stringify({game_id:snapshot.game.id,choice_id:id})});snapshot=r.snapshot;renderSnapshot(snapshot);if(r.event?.died){haptic('heavy');tone(180,.12);toast(r.event.respawn?`Your run ended. You wake in ${r.event.respawn.location}. The world continues.`:'Your run ended. The world continues.','bad')}else if(r.event?.convergence){tone(900,.08);toast('A shared convergence point has opened. Other players can shape this moment.','good')}else toast('World state saved.','good')}catch(e){toast(e.message||'Action failed.','bad')}finally{busy=false}}
+async function moderate(path){if(!snapshot?.game?.id)return;try{const r=await api(path,{method:'POST',body:JSON.stringify({game_id:snapshot.game.id})});snapshot.game=r.game;renderSnapshot(snapshot);toast(path.includes('pause')?'World paused safely.':'World resumed.')}catch(e){toast(e.message||'Control failed.','bad')}}
+$('sound').onclick=()=>{soundOn=!soundOn;$('sound').textContent=soundOn?'◉':'◌';if(soundOn)tone(620)};
+$('invite').onclick=async()=>{if(!snapshot?.game?.id)return;try{const r=await api('/api/miniapp/invite',{method:'POST',body:JSON.stringify({game_id:snapshot.game.id})});if(navigator.share){await navigator.share({title:'WHAT HAPPENS?',text:'Join our world',url:r.link})}else{await navigator.clipboard?.writeText(r.link);toast('Invite link copied.','good')}}catch(e){toast(e.message||'Invite failed.','bad')}};
+document.querySelectorAll('.nav').forEach(b=>b.onclick=()=>{activeTab=b.dataset.tab;document.querySelectorAll('.nav').forEach(x=>x.classList.remove('active'));b.classList.add('active');renderPanel()});
+async function sync(){try{const d=await api('/api/miniapp/bootstrap');permissions={is_admin:d.is_admin,can_moderate:d.can_moderate,can_terminate:d.can_terminate,can_manage_operators:d.can_manage_operators};renderSnapshot(d)}catch(e){$('loading').innerHTML=`<div style="color:#efb4ba">${esc(e.message||'Unable to connect')}</div>`}}
+setInterval(()=>{if(deadline&&Date.now()<deadline){$('timer').textContent=Math.ceil((deadline-Date.now())/1000)}},250);poll=setInterval(()=>{if(snapshot?.game?.status==='active'&&!busy&&activeTab==='world')sync()},8000);sync();
+})();
+</script>
 </body>
 </html>
